@@ -1413,10 +1413,47 @@ def test_cudss_config_knobs():
 
     with pytest.raises(ValueError, match="unknown reordering"):
         cudss.analyze(values, offsets, columns, reordering="bogus")
+    for alg in ("btf_colamd", "colamd", 1, 2):
+        with pytest.raises(ValueError, match="solve_only=True.*BTF/COLAMD"):
+            jax.jit(lambda v: cudss.analyze(
+                v, offsets, columns, reordering=alg, solve_only=True))(values)
     with pytest.raises(Exception, match="invalid reordering_id"):
         # raw enum ints pass through; out-of-range is the C++ backstop
         cudss.analyze(values, offsets, columns,
                       reordering=9).id.block_until_ready()
+
+    values, offsets, columns, A = _general_complex_system(n=24)
+    b = jnp.arange(1, 25, dtype=values.dtype)
+    operator = cudss.CSROperator(values, offsets, columns)
+    for settings in ({"emulation_bits": 55}, {"downcast_factors": "diagonal"},
+                     {"downcast_factors": "block_diagonal"}, {"solve_only": True}):
+        solver = cudss.CuDSS(**settings)
+        token = solver.init(operator, {})
+        solve = jax.jit(lambda t, rhs: solver.solve(t, rhs, ir_nsteps=3))
+        assert _rel_err(A, solve(token, b), b) < 1e-10
+        transposed, _ = solver.transpose(token, {})
+        assert _rel_err(A.T, solve(transposed, b), b) < 1e-10
+        cudss.release(token)
+        assert _rel_err(A.T, solve(transposed, b), b) < 1e-10
+        if settings.get("solve_only"):
+            with pytest.raises(ValueError, match="new analysis"):
+                solver.refactorize(token, operator)
+        else:
+            updated = solver.refactorize(token, cudss.CSROperator(2 * values, offsets, columns))
+            assert _rel_err(2 * A, solve(updated, b), b) < 1e-10
+            cudss.release(updated)
+        cudss.release(token)
+
+        def loss(scale):
+            op = cudss.CSROperator(scale * values, offsets, columns)
+            t = solver.init(op, {})
+            return jnp.sum(jnp.abs(solver.solve(t, b, ir_nsteps=3)) ** 2)
+
+        scales = jnp.array([1.0, 2.0])
+        value, derivative = jax.jit(jax.vmap(jax.value_and_grad(loss)))(scales)
+        expected = jnp.sum(jnp.abs(jnp.linalg.solve(A, b)) ** 2) / scales**2
+        np.testing.assert_allclose(value, expected, rtol=1e-10)
+        np.testing.assert_allclose(derivative, -2 * expected / scales, rtol=1e-10)
 
 
 def test_numeric_phases_rename():

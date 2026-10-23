@@ -305,6 +305,9 @@ static ffi::Error create_entry(
     const int64_t mview_id,
     const int64_t reordering_id,
     const int64_t memory_id,
+    const int64_t emulation_bits,
+    const int64_t downcast_id,
+    const int64_t solve_only,
     std::shared_ptr<BatchFactorEntry>* out
 ) {
     using nat = typename get_native_data_type<T>::type;
@@ -359,6 +362,16 @@ static ffi::Error create_entry(
     CUDSS_TOKEN_CHECK(cudssCreate(&e->handle), "cudssCreate");
     CUDSS_TOKEN_CHECK(cudssSetStream(e->handle, stream), "cudssSetStream");
     CUDSS_TOKEN_CHECK(cudssConfigCreate(&e->config), "cudssConfigCreate");
+    int bits = static_cast<int>(emulation_bits);
+    CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_EMULATION_MANTISSA_BIT_COUNT,
+        &bits, sizeof(bits)), "cudssConfigSet emulation precision");
+    auto downcast = static_cast<cudssDowncastFactorsMode_t>(downcast_id);
+    CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_DOWNCAST_FACTORS,
+        &downcast, sizeof(downcast)), "cudssConfigSet factor precision");
+    auto optimization = solve_only ? CUDSS_MEMORY_OPTIMIZATION_SOLVE_ONLY
+                                   : CUDSS_MEMORY_OPTIMIZATION_DEFAULT;
+    CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_MEMORY_OPTIMIZATION_SETTING,
+        &optimization, sizeof(optimization)), "cudssConfigSet memory optimization");
     // Per-block inertia requires scalar pivots; cuDSS omits 2x2 off-diagonals.
     if ((mtype_id == 1 || mtype_id == 2) && reordering_id != 1 && reordering_id != 2) {
         auto pivot = CUDSS_PIVOT_DIAGONAL;
@@ -437,13 +450,17 @@ static ffi::Error PbatchTokenAnalyze(
     const int64_t mtype_id,
     const int64_t mview_id,
     const int64_t reordering_id,
-    const int64_t memory_id
+    const int64_t memory_id,
+    const int64_t emulation_bits,
+    const int64_t downcast_id,
+    const int64_t solve_only
 ) {
     std::shared_ptr<BatchFactorEntry> e;
     if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
                                    columns_buf, fingerprint_buf, batch_size,
                                    device_id, mtype_id, mview_id,
-                                   reordering_id, memory_id, &e);
+                                   reordering_id, memory_id, emulation_bits,
+                                   downcast_id, solve_only, &e);
         err.failure()) return err;
     CUDA_TOKEN_CHECK(cudaEventRecord(e->done, stream));
     int32_t id = BatchTokenRegistry::instance().insert(std::move(e));
@@ -464,7 +481,10 @@ static ffi::Error PbatchTokenNumeric(
     const int64_t mtype_id,
     const int64_t mview_id,
     const int64_t reordering_id,
-    const int64_t memory_id
+    const int64_t memory_id,
+    const int64_t emulation_bits,
+    const int64_t downcast_id,
+    const int64_t solve_only
 ) {
     auto& r = BatchTokenRegistry::instance();
     PhaseLease lease;
@@ -481,7 +501,8 @@ static ffi::Error PbatchTokenNumeric(
         if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
                                        columns_buf, fingerprint_buf, 1,
                                        device_id, mtype_id, mview_id,
-                                       reordering_id, memory_id, &e);
+                                       reordering_id, memory_id, emulation_bits,
+                                       downcast_id, solve_only, &e);
             err.failure()) return err;
         r.rebuilds.fetch_add(1);
     } else {
@@ -518,6 +539,9 @@ static ffi::Error PbatchTokenSolve(
     const int64_t mview_id,
     const int64_t reordering_id,
     const int64_t memory_id,
+    const int64_t emulation_bits,
+    const int64_t downcast_id,
+    const int64_t solve_only,
     const int64_t solve_mode
 ) {
     PhaseLease lease;
@@ -532,7 +556,8 @@ static ffi::Error PbatchTokenSolve(
         if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
                                        columns_buf, fingerprint_buf, 1,
                                        device_id, mtype_id, mview_id,
-                                       reordering_id, memory_id, &e);
+                                       reordering_id, memory_id, emulation_bits,
+                                       downcast_id, solve_only, &e);
             err.failure()) return err;
         CUDSS_TOKEN_CHECK(cudssExecute(e->handle, CUDSS_PHASE_FACTORIZATION,
             e->config, e->data, e->A, e->x_dummy, e->b_dummy),
@@ -613,7 +638,10 @@ static ffi::Error PbatchTokenQuery(
     const int64_t mtype_id,
     const int64_t mview_id,
     const int64_t reordering_id,
-    const int64_t memory_id
+    const int64_t memory_id,
+    const int64_t emulation_bits,
+    const int64_t downcast_id,
+    const int64_t solve_only
 ) {
     PhaseLease lease;
     if (auto err = token_begin_phase<T>(stream, token_in, device_id, &lease);
@@ -626,7 +654,8 @@ static ffi::Error PbatchTokenQuery(
         if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
                                        columns_buf, fingerprint_buf, 1,
                                        device_id, mtype_id, mview_id,
-                                       reordering_id, memory_id, &e);
+                                       reordering_id, memory_id, emulation_bits,
+                                       downcast_id, solve_only, &e);
             err.failure()) return err;
         CUDSS_TOKEN_CHECK(cudssExecute(e->handle, CUDSS_PHASE_FACTORIZATION,
             e->config, e->data, e->A, e->x_dummy, e->b_dummy),
@@ -718,7 +747,10 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("mtype_id") \
             .Attr<int64_t>("mview_id") \
             .Attr<int64_t>("reordering_id") \
-            .Attr<int64_t>("memory_id")); \
+            .Attr<int64_t>("memory_id") \
+            .Attr<int64_t>("emulation_bits") \
+            .Attr<int64_t>("downcast_id") \
+            .Attr<int64_t>("solve_only")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenFactorize##TypeName, (PbatchTokenNumeric<DataType, false>), \
         ffi::Ffi::Bind() \
@@ -733,7 +765,10 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("mtype_id") \
             .Attr<int64_t>("mview_id") \
             .Attr<int64_t>("reordering_id") \
-            .Attr<int64_t>("memory_id")); \
+            .Attr<int64_t>("memory_id") \
+            .Attr<int64_t>("emulation_bits") \
+            .Attr<int64_t>("downcast_id") \
+            .Attr<int64_t>("solve_only")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenRefactorize##TypeName, (PbatchTokenNumeric<DataType, true>), \
         ffi::Ffi::Bind() \
@@ -748,7 +783,10 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("mtype_id") \
             .Attr<int64_t>("mview_id") \
             .Attr<int64_t>("reordering_id") \
-            .Attr<int64_t>("memory_id")); \
+            .Attr<int64_t>("memory_id") \
+            .Attr<int64_t>("emulation_bits") \
+            .Attr<int64_t>("downcast_id") \
+            .Attr<int64_t>("solve_only")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenSolve##TypeName, PbatchTokenSolve<DataType>, \
         ffi::Ffi::Bind() \
@@ -765,6 +803,9 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("mview_id") \
             .Attr<int64_t>("reordering_id") \
             .Attr<int64_t>("memory_id") \
+            .Attr<int64_t>("emulation_bits") \
+            .Attr<int64_t>("downcast_id") \
+            .Attr<int64_t>("solve_only") \
             .Attr<int64_t>("solve_mode")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenQuery##TypeName, PbatchTokenQuery<DataType>, \
@@ -793,7 +834,10 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("mtype_id") \
             .Attr<int64_t>("mview_id") \
             .Attr<int64_t>("reordering_id") \
-            .Attr<int64_t>("memory_id"));
+            .Attr<int64_t>("memory_id") \
+            .Attr<int64_t>("emulation_bits") \
+            .Attr<int64_t>("downcast_id") \
+            .Attr<int64_t>("solve_only"));
 
 DEFINE_PBATCH_TOKEN_FFI_HANDLERS(f32, ffi::F32);
 DEFINE_PBATCH_TOKEN_FFI_HANDLERS(f64, ffi::F64);

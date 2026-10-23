@@ -107,6 +107,9 @@ class FactorToken(eqx.Module):
     device_id: int = eqx.field(static=True)
     reordering_id: int = eqx.field(static=True)  # cudssReorderingAlg_t 0-5
     memory_id: int = eqx.field(static=True)      # 0 device, 1 hybrid host+device
+    emulation_bits: int = eqx.field(static=True)
+    downcast_id: int = eqx.field(static=True)
+    solve_only: bool = eqx.field(static=True)
     transposed: bool = eqx.field(static=True, default=False)
     conjugated: bool = eqx.field(static=True, default=False)
 
@@ -282,7 +285,8 @@ def _ffi_call4(name, out_specs, *operands, has_side_effect=True, **attrs):
 # rides every phase call (not just analyze) so a non-resident id (renamed
 # away by a later numeric phase, or LRU-evicted) can be rebuilt in the
 # handler from the call's own operands (self-healing; see solver.cpp).
-_CFG_KEYS = ("device_id", "mtype_id", "mview_id", "reordering_id", "memory_id")
+_CFG_KEYS = ("device_id", "mtype_id", "mview_id", "reordering_id", "memory_id",
+             "emulation_bits", "downcast_id", "solve_only")
 
 
 def _cfg_of(token):
@@ -419,6 +423,7 @@ _MVIEW_IDS = {"full": 0, "upper": 1, "lower": 2}
 _REORDERING_IDS = {"default": 0, "btf_colamd": 1, "colamd": 2, "amd": 3,
                    "nested_dissection": 4, "none": 5}
 _MEMORY_IDS = {"device": 0, "hybrid": 1}
+_DOWNCAST_IDS = {"disabled": 0, "block_diagonal": 1, "diagonal": 2}
 
 
 def _knob_id(table, value, what):
@@ -437,21 +442,33 @@ def analyze(csr_values, csr_offsets, csr_columns, *,
             mview_id: str | int = "upper",
             device_id=0,
             reordering: str | int = "default",
-            memory: str | int = "device") -> FactorToken:
+            memory: str | int = "device", emulation_bits: int = 0,
+            downcast_factors: str | int = "disabled",
+            solve_only: bool = False) -> FactorToken:
     """``mtype_id``: "general", "symmetric", "hermitian", "spd" or "hpd".
     ``mview_id``: "full", "upper" or "lower".
     ``reordering``: "default", "btf_colamd", "colamd", "amd",
     "nested_dissection" or "none" (natural order).
     ``memory``: "device" (default) or "hybrid" host+device factors.
+    ``emulation_bits`` enables emulated FP64 factorization (0 disables it).
+    ``downcast_factors`` stores factors in FP32, keeping the ``diagonal`` or
+    ``block_diagonal`` in FP64; ``disabled`` keeps full precision.
+    ``solve_only`` releases factorization workspace and forbids numeric updates.
+    Precision changes require checking residuals and, when needed, refinement.
     Every knob also accepts the raw cuDSS enum int.
 
     Column indices may be unsorted but must be unique within each row.
     """
+    reordering_id = _knob_id(_REORDERING_IDS, reordering, "reordering")
+    if solve_only and reordering_id in (1, 2):
+        raise ValueError("solve_only=True is unsupported with BTF/COLAMD reordering")
     cfg = (int(device_id),
            _knob_id(_MTYPE_IDS, mtype_id, "mtype"),
            _knob_id(_MVIEW_IDS, mview_id, "mview"),
-           _knob_id(_REORDERING_IDS, reordering, "reordering"),
-           _knob_id(_MEMORY_IDS, memory, "memory"))
+           reordering_id,
+           _knob_id(_MEMORY_IDS, memory, "memory"), int(emulation_bits),
+           _knob_id(_DOWNCAST_IDS, downcast_factors, "downcast_factors"),
+           bool(solve_only))
     core = _make_analyze_ad(_suffix(jnp.dtype(csr_values.dtype)), cfg)
     return core(csr_values, csr_offsets.astype(jnp.int32),
                 csr_columns.astype(jnp.int32))
@@ -515,6 +532,8 @@ def _require_factorized(token, op):
 
 def _numeric(token, csr_values, refactor):
     op = "refactorize" if refactor else "factorize"
+    if token.solve_only and token.phase == "factorized":
+        raise ValueError(f"{op} requires a new analysis when solve_only=True")
     if refactor:
         _require_factorized(token, op)
     if jnp.dtype(csr_values.dtype) != token.dtype:
@@ -857,7 +876,8 @@ def _transpose_solve_general(token, rhs, nsteps):
     t_token = analyze(t_vals, t_offs, t_cols,
                       mtype_id=0, mview_id=0, device_id=token.device_id,
                       reordering=token.reordering_id,
-                      memory=token.memory_id)
+                      memory=token.memory_id, emulation_bits=token.emulation_bits,
+                      downcast_factors=token.downcast_id, solve_only=token.solve_only)
     t_token = factorize(t_token, t_token.values)
     t_token = dataclasses.replace(t_token, conjugated=token.conjugated)
     rf = rhs.reshape(rhs.shape[:-2] + (-1,)) if B > 1 else rhs
@@ -1140,6 +1160,9 @@ class CuDSS(lx.AbstractLinearSolver):
     # cuDSS knobs (see ``analyze``): reordering algorithm and factor storage
     reordering: str = "default"
     memory: str = "device"
+    emulation_bits: int = 0
+    downcast_factors: str = "disabled"  # Check residuals when reducing precision.
+    solve_only: bool = False  # Reanalyze before changing matrix values.
 
     # explicit phases ----------------------------------------------------------
 
@@ -1150,7 +1173,9 @@ class CuDSS(lx.AbstractLinearSolver):
             mtype_id = 0
         return analyze(operator.values, operator.offsets, operator.columns,
                        mtype_id=mtype_id, mview_id=0,
-                       reordering=self.reordering, memory=self.memory)
+                       reordering=self.reordering, memory=self.memory,
+                       emulation_bits=self.emulation_bits,
+                       downcast_factors=self.downcast_factors, solve_only=self.solve_only)
 
     def factorize(self, token, operator):
         return factorize(token, operator.values)
