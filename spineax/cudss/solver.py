@@ -110,6 +110,7 @@ class FactorToken(eqx.Module):
     emulation_bits: int = eqx.field(static=True)
     downcast_id: int = eqx.field(static=True)
     solve_only: bool = eqx.field(static=True)
+    pivot_id: int = eqx.field(static=True)
     transposed: bool = eqx.field(static=True, default=False)
     conjugated: bool = eqx.field(static=True, default=False)
 
@@ -317,6 +318,7 @@ _CFG_KEYS = (
     "emulation_bits",
     "downcast_id",
     "solve_only",
+    "pivot_id",
 )
 
 
@@ -489,6 +491,15 @@ _REORDERING_IDS = {
 }
 _MEMORY_IDS = {"device": 0, "hybrid": 1}
 _DOWNCAST_IDS = {"disabled": 0, "block_diagonal": 1, "diagonal": 2}
+_PIVOT_IDS = {
+    "auto": 0,
+    "none": 1,
+    "global_col": 2,
+    "global_row": 3,
+    "diagonal": 4,
+    "local_block": 5,
+    "bunch_kaufman": 6,
+}
 
 
 def _knob_id(table, value, what):
@@ -515,6 +526,7 @@ def analyze(
     emulation_bits: int = 0,
     downcast_factors: str | int = "disabled",
     solve_only: bool = False,
+    pivoting: str | int = "auto",
 ) -> FactorToken:
     """``mtype_id``: "general", "symmetric", "hermitian", "spd" or "hpd".
     ``mview_id``: "full", "upper" or "lower".
@@ -525,23 +537,37 @@ def analyze(
     ``downcast_factors`` stores factors in FP32, keeping the ``diagonal`` or
     ``block_diagonal`` in FP64; ``disabled`` keeps full precision.
     ``solve_only`` releases factorization workspace and forbids numeric updates.
+    ``pivoting`` selects cuDSS pivoting. Use ``diagonal`` for per-matrix inertia.
     Precision changes require checking residuals and, when needed, refinement.
     Every knob also accepts the raw cuDSS enum int.
 
     Column indices may be unsorted but must be unique within each row.
     """
     reordering_id = _knob_id(_REORDERING_IDS, reordering, "reordering")
+    mtype_id = _knob_id(_MTYPE_IDS, mtype_id, "mtype")
+    pivot_id = _knob_id(_PIVOT_IDS, pivoting, "pivoting")
+    if pivot_id not in _PIVOT_IDS.values():
+        raise ValueError("pivoting must be a cudssPivotType_t value (0-6)")
+    if pivot_id in (4, 6) and reordering_id in (1, 2):
+        raise ValueError(
+            "Diagonal and Bunch-Kaufman pivoting require ND, AMD or natural ordering"
+        )
+    if pivot_id == 6 and mtype_id not in (1, 2):
+        raise ValueError(
+            "Bunch-Kaufman pivoting requires a symmetric or Hermitian indefinite matrix"
+        )
     if solve_only and reordering_id in (1, 2):
         raise ValueError("solve_only=True is unsupported with BTF/COLAMD reordering")
     cfg = (
         int(device_id),
-        _knob_id(_MTYPE_IDS, mtype_id, "mtype"),
+        mtype_id,
         _knob_id(_MVIEW_IDS, mview_id, "mview"),
         reordering_id,
         _knob_id(_MEMORY_IDS, memory, "memory"),
         int(emulation_bits),
         _knob_id(_DOWNCAST_IDS, downcast_factors, "downcast_factors"),
         bool(solve_only),
+        pivot_id,
     )
     core = _make_analyze_ad(_suffix(jnp.dtype(csr_values.dtype)), cfg)
     return core(
@@ -1012,6 +1038,7 @@ def _transpose_solve_general(token, rhs, nsteps):
         emulation_bits=token.emulation_bits,
         downcast_factors=token.downcast_id,
         solve_only=token.solve_only,
+        pivoting=token.pivot_id,
     )
     t_token = factorize(t_token, t_token.values)
     t_token = dataclasses.replace(t_token, conjugated=token.conjugated)
@@ -1034,6 +1061,7 @@ _QUERY_FIELDS = (
     "nd_partition_tree",
     "nsuperpanels",
     "schur_shape",
+    "inertia_is_broadcast",
 )
 
 
@@ -1047,7 +1075,7 @@ _QUERY_SPLIT_FIELDS = frozenset({"diag", "scale_row", "scale_col"})
 
 @cache
 def _make_query(suffix, dtype, n, tree, cfg):
-    """token -> tuple of the 14 query outputs for a system of dimension n.
+    """Factor diagnostics and batching metadata for a system of dimension n.
 
     The CSR arrays ride along like every other phase so a non-resident id
     self-heals (and a resident one gets the fingerprint tamper check)."""
@@ -1080,7 +1108,7 @@ def _make_query(suffix, dtype, n, tree, cfg):
             values,
             **dict(zip(_CFG_KEYS, cfg)),
         )
-        return tuple(outs)
+        return (*outs, jnp.asarray(False))
 
     @query_id.def_vmap
     def _(axis_size, in_batched, token_id, offsets, columns, values):
@@ -1095,6 +1123,8 @@ def _make_query(suffix, dtype, n, tree, cfg):
         )
         batched = []
         for field, a in zip(_QUERY_FIELDS, outs):
+            if field == "inertia_is_broadcast":
+                a = a | (axis_size > 1)
             if field in _QUERY_SPLIT_FIELDS:
                 batched.append(a.reshape(axis_size, n))
             else:
@@ -1105,7 +1135,7 @@ def _make_query(suffix, dtype, n, tree, cfg):
 
 
 def query(token: FactorToken) -> dict:
-    """Read factor diagnostics; transformed tokens share the original factors."""
+    """Read factor diagnostics. Undefined inertia counts are -1."""
     _require_factorized(token, "query")
     B = _batch_of(token)
     tree = int(_ps.nd_partition_tree_size())
@@ -1120,31 +1150,56 @@ def query(token: FactorToken) -> dict:
         outs = fn(tid, offs_bd, cols_bd, token.values.reshape(-1))
     else:
         outs = fn(token.id, token.offsets, token.columns, token.values)
-    return dict(zip(_QUERY_FIELDS, outs))
+    data = dict(zip(_QUERY_FIELDS, outs))
+    has_inertia = token.mtype_id in (2, 4) or (
+        token.mtype_id in (1, 3)
+        and not jnp.issubdtype(token.dtype, jnp.complexfloating)
+    )
+    data["scalar_pivots"] = jnp.asarray(
+        has_inertia
+        and token.reordering_id not in (1, 2)
+        and (token.pivot_id in (1, 4) or token.mtype_id in (3, 4))
+    )
+    if not has_inertia:
+        data["inertia"] = jnp.full_like(data["inertia"], -1)
+    return data
 
 
 def inertia(data: dict, batch_size: int = 1):
-    """Per-block [positive, negative] inertia from the LDL factor diagonal.
+    """Return [positive, negative] counts for real symmetric or Hermitian matrices.
 
-    Factorizations use scalar pivots so each sign belongs to one input block.
-    cuDSS omits the off-diagonal entries needed to count signs of 2x2 pivots.
-    Magnitudes below 1e-13 are excluded from both counts.
+    Per-matrix counts under vmap or with ``batch_size > 1`` require scalar
+    pivots. Diagonal magnitudes below 1e-13 are excluded from those counts.
+    ``data["inertia"]`` contains cuDSS's total for the factorization.
     """
     diag = data["diag"]
+    if batch_size < 1 or diag.shape[0] % batch_size:
+        raise ValueError("batch_size must divide the factor diagonal length")
+    if batch_size > 1:
+        diag = eqx.error_if(
+            diag,
+            ~data["scalar_pivots"],
+            "Per-matrix inertia requires pivoting='diagonal'",
+        )
     diag_real = diag.real if jnp.iscomplexobj(diag) else diag
     n = diag.shape[0] // batch_size
 
     out = diag_real.reshape([batch_size, n])
 
-    # cuDSS pivoting threshold seems to be 1e-13. everything above this on
-    # plus or minus side seems to reliably indicate that particular inertia value.
     threshold = 1e-13
     positive = jnp.sum(out >= threshold, axis=1)
     negative = jnp.sum(out <= -threshold, axis=1)
 
     result = jnp.stack([positive, negative], axis=1, dtype=jnp.int32)
 
-    return result if batch_size > 1 else result[0]
+    if batch_size > 1:
+        return result
+    result = jnp.where(data["scalar_pivots"], result[0], data["inertia"])
+    return eqx.error_if(
+        result,
+        ~data["scalar_pivots"] & (data["inertia_is_broadcast"] | jnp.any(result < 0)),
+        "Inertia requires a symmetric/Hermitian matrix and per-matrix counts require pivoting='diagonal'",
+    )
 
 
 # registry escape hatches ======================================================
@@ -1312,6 +1367,7 @@ class CuDSS(lx.AbstractLinearSolver):
     emulation_bits: int = 0
     downcast_factors: str = "disabled"  # Check residuals when reducing precision.
     solve_only: bool = False  # Reanalyze before changing matrix values.
+    pivoting: str = "auto"
 
     # explicit phases ----------------------------------------------------------
 
@@ -1331,6 +1387,7 @@ class CuDSS(lx.AbstractLinearSolver):
             emulation_bits=self.emulation_bits,
             downcast_factors=self.downcast_factors,
             solve_only=self.solve_only,
+            pivoting=self.pivoting,
         )
 
     def factorize(self, token, operator):

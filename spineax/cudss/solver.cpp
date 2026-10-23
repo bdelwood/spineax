@@ -308,6 +308,7 @@ static ffi::Error create_entry(
     const int64_t emulation_bits,
     const int64_t downcast_id,
     const int64_t solve_only,
+    const int64_t pivot_id,
     std::shared_ptr<BatchFactorEntry>* out
 ) {
     using nat = typename get_native_data_type<T>::type;
@@ -372,12 +373,9 @@ static ffi::Error create_entry(
                                    : CUDSS_MEMORY_OPTIMIZATION_DEFAULT;
     CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_MEMORY_OPTIMIZATION_SETTING,
         &optimization, sizeof(optimization)), "cudssConfigSet memory optimization");
-    // Per-block inertia requires scalar pivots; cuDSS omits 2x2 off-diagonals.
-    if ((mtype_id == 1 || mtype_id == 2) && reordering_id != 1 && reordering_id != 2) {
-        auto pivot = CUDSS_PIVOT_DIAGONAL;
-        CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_PIVOT_TYPE,
-            &pivot, sizeof(pivot)), "cudssConfigSet pivot type");
-    }
+    auto pivot = static_cast<cudssPivotType_t>(pivot_id);
+    CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_PIVOT_TYPE,
+        &pivot, sizeof(pivot)), "cudssConfigSet pivot type");
     if (reordering_id < 0 || reordering_id > CUDSS_REORDERING_ALG_NONE) {
         return ffi::Error::Internal(
             "spineax pbatch token: invalid reordering_id (cudssReorderingAlg_t: "
@@ -453,14 +451,15 @@ static ffi::Error PbatchTokenAnalyze(
     const int64_t memory_id,
     const int64_t emulation_bits,
     const int64_t downcast_id,
-    const int64_t solve_only
+    const int64_t solve_only,
+    const int64_t pivot_id
 ) {
     std::shared_ptr<BatchFactorEntry> e;
     if (auto err = create_entry<T>(stream, csr_values_buf, offsets_buf,
                                    columns_buf, fingerprint_buf, batch_size,
                                    device_id, mtype_id, mview_id,
                                    reordering_id, memory_id, emulation_bits,
-                                   downcast_id, solve_only, &e);
+                                   downcast_id, solve_only, pivot_id, &e);
         err.failure()) return err;
     CUDA_TOKEN_CHECK(cudaEventRecord(e->done, stream));
     int32_t id = BatchTokenRegistry::instance().insert(std::move(e));
@@ -484,7 +483,8 @@ static ffi::Error PbatchTokenNumeric(
     const int64_t memory_id,
     const int64_t emulation_bits,
     const int64_t downcast_id,
-    const int64_t solve_only
+    const int64_t solve_only,
+    const int64_t pivot_id
 ) {
     auto& r = BatchTokenRegistry::instance();
     PhaseLease lease;
@@ -502,7 +502,7 @@ static ffi::Error PbatchTokenNumeric(
                                        columns_buf, fingerprint_buf, 1,
                                        device_id, mtype_id, mview_id,
                                        reordering_id, memory_id, emulation_bits,
-                                       downcast_id, solve_only, &e);
+                                       downcast_id, solve_only, pivot_id, &e);
             err.failure()) return err;
         r.rebuilds.fetch_add(1);
     } else {
@@ -542,6 +542,7 @@ static ffi::Error PbatchTokenSolve(
     const int64_t emulation_bits,
     const int64_t downcast_id,
     const int64_t solve_only,
+    const int64_t pivot_id,
     const int64_t solve_mode
 ) {
     PhaseLease lease;
@@ -557,7 +558,7 @@ static ffi::Error PbatchTokenSolve(
                                        columns_buf, fingerprint_buf, 1,
                                        device_id, mtype_id, mview_id,
                                        reordering_id, memory_id, emulation_bits,
-                                       downcast_id, solve_only, &e);
+                                       downcast_id, solve_only, pivot_id, &e);
             err.failure()) return err;
         CUDSS_TOKEN_CHECK(cudssExecute(e->handle, CUDSS_PHASE_FACTORIZATION,
             e->config, e->data, e->A, e->x_dummy, e->b_dummy),
@@ -641,7 +642,8 @@ static ffi::Error PbatchTokenQuery(
     const int64_t memory_id,
     const int64_t emulation_bits,
     const int64_t downcast_id,
-    const int64_t solve_only
+    const int64_t solve_only,
+    const int64_t pivot_id
 ) {
     PhaseLease lease;
     if (auto err = token_begin_phase<T>(stream, token_in, device_id, &lease);
@@ -655,7 +657,7 @@ static ffi::Error PbatchTokenQuery(
                                        columns_buf, fingerprint_buf, 1,
                                        device_id, mtype_id, mview_id,
                                        reordering_id, memory_id, emulation_bits,
-                                       downcast_id, solve_only, &e);
+                                       downcast_id, solve_only, pivot_id, &e);
             err.failure()) return err;
         CUDSS_TOKEN_CHECK(cudssExecute(e->handle, CUDSS_PHASE_FACTORIZATION,
             e->config, e->data, e->A, e->x_dummy, e->b_dummy),
@@ -686,13 +688,13 @@ static ffi::Error PbatchTokenQuery(
     size_t written = 0;
 
     // host-side scalars: dataGet to host, then H2D into the result buffer;
-    // zero on failure so Python always gets well-defined values
-    #define QUERY_HOST_SCALAR(PARAM, TYPE, COUNT, BUF) \
+    // Use a sentinel for unavailable inertia so it cannot look like zero counts.
+    #define QUERY_HOST_SCALAR(PARAM, TYPE, COUNT, BUF, FALLBACK) \
         do { \
             TYPE tmp_[COUNT] = {}; \
             if (cudssDataGet(e->handle, e->data, PARAM, tmp_, sizeof(tmp_), \
                              &written) != CUDSS_STATUS_SUCCESS) { \
-                for (int i_ = 0; i_ < (COUNT); ++i_) tmp_[i_] = 0; \
+                for (int i_ = 0; i_ < (COUNT); ++i_) tmp_[i_] = FALLBACK; \
             } \
             CUDA_TOKEN_CHECK(cudaMemcpy((BUF)->typed_data(), tmp_, sizeof(tmp_), \
                                         cudaMemcpyHostToDevice)); \
@@ -707,11 +709,11 @@ static ffi::Error PbatchTokenQuery(
             } \
         } while (0)
 
-    QUERY_HOST_SCALAR(CUDSS_DATA_LU_NNZ, int64_t, 1, lu_nnz_buf);
-    QUERY_HOST_SCALAR(CUDSS_DATA_NPIVOTS, int32_t, 1, npivots_buf);
-    QUERY_HOST_SCALAR(CUDSS_DATA_INERTIA, int32_t, 2, inertia_buf);
-    QUERY_HOST_SCALAR(CUDSS_DATA_NSUPERPANELS, int32_t, 1, nsuperpanels_buf);
-    QUERY_HOST_SCALAR(CUDSS_DATA_SCHUR_SHAPE, int64_t, 2, schur_shape_buf);
+    QUERY_HOST_SCALAR(CUDSS_DATA_LU_NNZ, int64_t, 1, lu_nnz_buf, 0);
+    QUERY_HOST_SCALAR(CUDSS_DATA_NPIVOTS, int32_t, 1, npivots_buf, 0);
+    QUERY_HOST_SCALAR(CUDSS_DATA_INERTIA, int32_t, 2, inertia_buf, -1);
+    QUERY_HOST_SCALAR(CUDSS_DATA_NSUPERPANELS, int32_t, 1, nsuperpanels_buf, 0);
+    QUERY_HOST_SCALAR(CUDSS_DATA_SCHUR_SHAPE, int64_t, 2, schur_shape_buf, 0);
 
     QUERY_DEVICE_ARRAY(CUDSS_DATA_PERM_REORDER_ROW, perm_reorder_row_buf, N * sizeof(int32_t));
     QUERY_DEVICE_ARRAY(CUDSS_DATA_PERM_REORDER_COL, perm_reorder_col_buf, N * sizeof(int32_t));
@@ -750,7 +752,8 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("memory_id") \
             .Attr<int64_t>("emulation_bits") \
             .Attr<int64_t>("downcast_id") \
-            .Attr<int64_t>("solve_only")); \
+            .Attr<int64_t>("solve_only") \
+            .Attr<int64_t>("pivot_id")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenFactorize##TypeName, (PbatchTokenNumeric<DataType, false>), \
         ffi::Ffi::Bind() \
@@ -768,7 +771,8 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("memory_id") \
             .Attr<int64_t>("emulation_bits") \
             .Attr<int64_t>("downcast_id") \
-            .Attr<int64_t>("solve_only")); \
+            .Attr<int64_t>("solve_only") \
+            .Attr<int64_t>("pivot_id")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenRefactorize##TypeName, (PbatchTokenNumeric<DataType, true>), \
         ffi::Ffi::Bind() \
@@ -786,7 +790,8 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("memory_id") \
             .Attr<int64_t>("emulation_bits") \
             .Attr<int64_t>("downcast_id") \
-            .Attr<int64_t>("solve_only")); \
+            .Attr<int64_t>("solve_only") \
+            .Attr<int64_t>("pivot_id")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenSolve##TypeName, PbatchTokenSolve<DataType>, \
         ffi::Ffi::Bind() \
@@ -806,6 +811,7 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("emulation_bits") \
             .Attr<int64_t>("downcast_id") \
             .Attr<int64_t>("solve_only") \
+            .Attr<int64_t>("pivot_id") \
             .Attr<int64_t>("solve_mode")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenQuery##TypeName, PbatchTokenQuery<DataType>, \
@@ -837,7 +843,8 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("memory_id") \
             .Attr<int64_t>("emulation_bits") \
             .Attr<int64_t>("downcast_id") \
-            .Attr<int64_t>("solve_only"));
+            .Attr<int64_t>("solve_only") \
+            .Attr<int64_t>("pivot_id"));
 
 DEFINE_PBATCH_TOKEN_FFI_HANDLERS(f32, ffi::F32);
 DEFINE_PBATCH_TOKEN_FFI_HANDLERS(f64, ffi::F64);

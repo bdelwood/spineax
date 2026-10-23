@@ -316,6 +316,8 @@ def test_complex_general(dtype):
     token = cudss.factorize(token, values)
     x = cudss.solve(token, b)
     assert _rel_err(A, x, b) < _TOL[dtype]
+    with pytest.raises(Exception, match="Inertia requires"):
+        jax.jit(lambda t: cudss.inertia(cudss.query(t)))(token).block_until_ready()
 
 
 def test_jit_full_chain():
@@ -360,7 +362,7 @@ def test_explicit_typed_ffi_api_version():
     assert len(calls) >= 4  # analyze, factorize, query, solve(s)
     assert all("api_version = 4" in line for line in calls)
     assert all("has_side_effect = true" in line for line in calls)
-    assert "mhlo.backend_config" not in txt
+    assert all("mhlo.backend_config" not in line for line in calls)
     # analyze's static config rides the backend_config DICT attribute
     (analyze_line,) = [line for line in calls if "analyze" in line]
     assert "mtype_id = 1" in analyze_line and "batch_size = 1" in analyze_line
@@ -416,7 +418,9 @@ def test_vmap_batch_is_block_diagonal(monkeypatch):
     b_batch = jnp.stack([b, b])
 
     size_before = cudss.registry_size()
-    tokens = jax.vmap(lambda v: cudss.analyze(v, offsets, columns))(vals_batch)
+    tokens = jax.vmap(
+        lambda v: cudss.analyze(v, offsets, columns, pivoting="diagonal")
+    )(vals_batch)
     # ONE block-diagonal entry, its id broadcast across the batch
     assert tokens.id.shape == (2, 1)
     ids = np.asarray(tokens.id)
@@ -442,7 +446,7 @@ def test_explicit_batch_door():
     values, offsets, columns, A = _sym_system()
     n = A.shape[0]
     vals = jnp.stack([values, values * 2.0, values * 5.0])
-    token = cudss.analyze(vals, offsets, columns)
+    token = cudss.analyze(vals, offsets, columns, pivoting="diagonal")
     assert token.kind == "pbatch"
     assert token.batch_size == 3
     token = cudss.factorize(token, vals)
@@ -559,17 +563,22 @@ def test_custom_vjp_adjoint_reuse(monkeypatch):
 
 
 # inertia ======================================================================
-def test_inertia_indefinite():
+@pytest.mark.parametrize("pivoting", ["auto", "diagonal", "bunch_kaufman"])
+@pytest.mark.parametrize("mtype, offdiag", [("symmetric", 2.0), ("hermitian", 2j)])
+def test_inertia_indefinite(pivoting, mtype, offdiag):
     _require_gpu()
-    # shift=0: random symmetric, genuinely indefinite
-    values, offsets, columns, A = _sym_system(n=40, shift=0.0, seed=12)
-    eigs = np.linalg.eigvalsh(np.asarray(A))
-    expected = [int((eigs > 0).sum()), int((eigs < 0).sum())]
-
-    token = cudss.analyze(values, offsets, columns)
+    # Positive diagonal entries can belong to an indefinite 2x2 pivot.
+    values = jnp.array([1.0, offdiag, 1.0])
+    offsets = jnp.array([0, 2, 3], dtype=jnp.int32)
+    columns = jnp.array([0, 1, 1], dtype=jnp.int32)
+    token = cudss.analyze(values, offsets, columns, mtype_id=mtype, pivoting=pivoting)
     token = cudss.factorize(token, values)
-    inertia = cudss.inertia(cudss.query(token))
-    np.testing.assert_array_equal(np.asarray(inertia), expected)
+    for _ in range(2):
+        data = cudss.query(token)
+        np.testing.assert_array_equal(jax.jit(cudss.inertia)(data), [1, 1])
+        if pivoting != "diagonal":
+            assert jnp.all(data["diag"].real > 0)
+        cudss.release(token)
 
 
 def test_inertia_heterogeneous_batch_attribution():
@@ -600,10 +609,20 @@ def test_inertia_heterogeneous_batch_attribution():
     )
     vals = jnp.asarray(np.stack([np.triu(A)[mask] for A in blocks]))
 
-    token = cudss.analyze(vals, offsets, columns, mtype_id=1, mview_id=1)
+    token = cudss.analyze(
+        vals, offsets, columns, mtype_id=1, mview_id=1, pivoting="diagonal"
+    )
     token = cudss.factorize(token, vals)
     inertia = cudss.inertia(cudss.query(token), batch_size=4)
     np.testing.assert_array_equal(np.asarray(inertia), expected)
+
+    token = cudss.factorize(cudss.analyze(vals, offsets, columns), vals)
+    data = cudss.query(token)
+    np.testing.assert_array_equal(
+        jax.jit(cudss.inertia)(data), np.sum(expected, axis=0)
+    )
+    with pytest.raises(Exception, match="Per-matrix inertia requires"):
+        jax.jit(lambda d: cudss.inertia(d, batch_size=4))(data).block_until_ready()
 
 
 def test_query_inertia_under_vmap():
@@ -633,7 +652,9 @@ def test_query_inertia_under_vmap():
     @jax.jit
     @jax.vmap
     def per_block(v):
-        t = cudss.analyze(v, offsets, columns, mtype_id=1, mview_id=1)
+        t = cudss.analyze(
+            v, offsets, columns, mtype_id=1, mview_id=1, pivoting="diagonal"
+        )
         t = cudss.factorize(t, v)
         data = cudss.query(t)
         return cudss.inertia(data), data["diag"], data["lu_nnz"]
@@ -645,6 +666,15 @@ def test_query_inertia_under_vmap():
     # matrix diagonal; sanity-check block attribution via the sign counts
     assert lu_nnz.shape == (4, 1)  # block-global field: broadcast
     assert len(set(np.asarray(lu_nnz).ravel().tolist())) == 1
+
+    @jax.jit
+    @jax.vmap
+    def unsupported(v):
+        t = cudss.factorize(cudss.analyze(v, offsets, columns), v)
+        return cudss.inertia(cudss.query(t))
+
+    with pytest.raises(Exception, match="per-matrix counts require"):
+        unsupported(vals).block_until_ready()
 
 
 def test_query_inertia_under_nested_vmap():
@@ -674,7 +704,9 @@ def test_query_inertia_under_nested_vmap():
     @jax.vmap
     @jax.vmap
     def per_block(v):
-        t = cudss.analyze(v, offsets, columns, mtype_id=1, mview_id=1)
+        t = cudss.analyze(
+            v, offsets, columns, mtype_id=1, mview_id=1, pivoting="diagonal"
+        )
         t = cudss.factorize(t, v)
         data = cudss.query(t)
         return cudss.inertia(data), data["diag"], data["lu_nnz"]
@@ -944,7 +976,8 @@ def test_query(dtype):
     offsets, columns, values = _csr_of(M1)  # upper triangle, mview upper
     n = b1.shape[0]
 
-    token = cudss.analyze(values, offsets, columns, mtype_id=1, mview_id=1)
+    mtype = "hermitian" if jnp.issubdtype(dtype, jnp.complexfloating) else "symmetric"
+    token = cudss.analyze(values, offsets, columns, mtype_id=mtype, mview_id=1)
     token = cudss.factorize(token, values)
     x = cudss.solve(token, b1)
     assert jnp.allclose(x, true_x1, rtol=1e-5, atol=1e-5)
@@ -1225,12 +1258,13 @@ def test_lineax_adapter():
     operator = cudss.CSROperator(sp.data, sp.indptr, sp.indices, lx.symmetric_tag)
     assert lx.is_symmetric(operator)
     assert operator.transpose() is operator
-    solver = cudss.CuDSS()
+    solver = cudss.CuDSS(pivoting="diagonal")
     b = jnp.asarray(np.random.default_rng(23).standard_normal(A.shape[0]))
 
     # explicit phases incl. query; symmetric tag resolves to mtype 1 (LDL)
     token = solver.analyze(operator)
     assert token.mtype_id == 1
+    assert token.pivot_id == 4
     token = solver.factorize(token, operator)
     x = solver.solve(token, b)
     assert _rel_err(A, x, b) < 1e-10
@@ -1463,6 +1497,18 @@ def test_cudss_config_knobs():
 
     with pytest.raises(ValueError, match="unknown reordering"):
         cudss.analyze(values, offsets, columns, reordering="bogus")
+    for pivoting in ("bogus", 7):
+        with pytest.raises(ValueError, match="pivoting"):
+            cudss.analyze(values, offsets, columns, pivoting=pivoting)
+    for pivoting in ("diagonal", "bunch_kaufman"):
+        with pytest.raises(ValueError, match="pivoting require"):
+            cudss.analyze(
+                values, offsets, columns, reordering="colamd", pivoting=pivoting
+            )
+    with pytest.raises(ValueError, match="requires a symmetric"):
+        cudss.analyze(
+            values, offsets, columns, mtype_id="general", pivoting="bunch_kaufman"
+        )
     for alg in ("btf_colamd", "colamd", 1, 2):
         with pytest.raises(ValueError, match="solve_only=True.*BTF/COLAMD"):
             jax.jit(

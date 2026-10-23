@@ -31,8 +31,9 @@ def test_datatypes(dtype):
     csr_offsets1, csr_columns1, csr_values1 = LHS1.indptr, LHS1.indices, LHS1.data
 
     # full symmetric matrix passed in, full view
+    mtype = "hermitian" if jnp.issubdtype(dtype, jnp.complexfloating) else "symmetric"
     token = cudss.analyze(
-        csr_values1, csr_offsets1, csr_columns1, mtype_id=1, mview_id=0
+        csr_values1, csr_offsets1, csr_columns1, mtype_id=mtype, mview_id=0
     )
     token = cudss.factorize(token, csr_values1)
     x = cudss.solve(token, b1)

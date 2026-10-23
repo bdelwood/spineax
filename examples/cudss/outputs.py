@@ -2,8 +2,8 @@
 
 query(token) is the one data door: every cuDSS data item is returned
 unconditionally (zero-filled where cuDSS declines for this matrix type /
-config), and you take what you need — e.g. inertia(data) for the per-block
-[positive, negative] eigenvalue counts.
+config, except unavailable inertia is -1), and you take what you need —
+e.g. inertia(data) for the per-block [positive, negative] eigenvalue counts.
 """
 
 import jax.numpy as jnp
@@ -80,8 +80,7 @@ def test_outputs():
     )
     print(f"schur_shape (disabled by default): {data['schur_shape']}")
 
-    # spineax's per-block LDL^T inertia, sign counts of the block-aligned diag
-    print(f"inertia (spineax, per-block from diag): {cudss.inertia(data)}")
+    print(f"inertia (positive, negative): {cudss.inertia(data)}")
 
 
 test_outputs()

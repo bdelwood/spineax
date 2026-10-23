@@ -84,7 +84,9 @@ def main():
     vals = values(rho)
 
     # 1. analyze ONCE: one block-diagonal entry for the whole batch
-    token = cudss.analyze(vals, offsets, columns, mtype_id=1, mview_id=1)
+    token = cudss.analyze(
+        vals, offsets, columns, mtype_id=1, mview_id=1, pivoting="diagonal"
+    )
     # 2. first factorization (fresh pivoting)
     token = cudss.factorize(token, vals)
 

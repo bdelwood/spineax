@@ -76,7 +76,7 @@ def test_heterogeneous_patterns():
     cols = jnp.asarray(np.stack([s[2] for s in systems]), jnp.int32)
     b = jnp.asarray(rng.standard_normal((2, n)))
 
-    token = cudss.analyze(vals, offs, cols, mtype_id=1, mview_id=1)
+    token = cudss.analyze(vals, offs, cols, mtype_id=1, mview_id=1, pivoting="diagonal")
     token = cudss.factorize(token, vals)
     x = cudss.solve(token, b)
     inertia = cudss.inertia(cudss.query(token), batch_size=2)
@@ -119,6 +119,7 @@ def test_heterogeneous_sizes():
         jnp.asarray(columns, jnp.int32),
         mtype_id=1,
         mview_id=1,
+        pivoting="diagonal",
     )
     token = cudss.factorize(token, jnp.asarray(values))
     x = np.asarray(cudss.solve(token, jnp.asarray(b)))
