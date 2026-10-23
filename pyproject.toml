@@ -41,7 +41,16 @@ dev = [
     "nanobind",
     "ninja",
     "pytest",
+    "ruff",
 ]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+# Imports follow jax configuration or module sections; callbacks use lambdas.
+ignore = ["E402", "E731"]
 
 [tool.pytest.ini_options]
 testpaths = [

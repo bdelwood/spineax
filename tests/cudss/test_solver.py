@@ -44,7 +44,7 @@ def _general_complex_system(n=30, dtype=jnp.complex128, seed=1):
     A = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
     A = A + n * np.eye(n)
     columns = np.tile(np.arange(n, dtype=np.int32), n)
-    offsets = (np.arange(n + 1, dtype=np.int32) * n)
+    offsets = np.arange(n + 1, dtype=np.int32) * n
     values = A.reshape(-1)
     return (
         jnp.asarray(values, dtype=dtype),
@@ -143,16 +143,20 @@ def test_cusparse_transpose_transforms():
     )
 
     batch = jnp.stack((values, 2.0 * values, -values))
-    transpose_batch = jax.jit(jax.vmap(
-        _transpose_csr,
-        in_axes=(0, None, None),
-        out_axes=(0, None, None),
-    ))
+    transpose_batch = jax.jit(
+        jax.vmap(
+            _transpose_csr,
+            in_axes=(0, None, None),
+            out_axes=(0, None, None),
+        )
+    )
     actual_values, actual_offsets, actual_columns = transpose_batch(
         batch, offsets, columns
     )
     expected = _transpose_reference(values, offsets, columns)
-    np.testing.assert_array_equal(np.asarray(actual_values), np.asarray(batch[:, order]))
+    np.testing.assert_array_equal(
+        np.asarray(actual_values), np.asarray(batch[:, order])
+    )
     np.testing.assert_array_equal(np.asarray(actual_offsets), np.asarray(expected[1]))
     np.testing.assert_array_equal(np.asarray(actual_columns), np.asarray(expected[2]))
 
@@ -165,17 +169,25 @@ def test_cusparse_transpose_batched_patterns():
     _require_gpu()
     n, B = 6, 3
     rng = np.random.default_rng(40)
-    cols_b = jnp.asarray(np.stack(
-        [np.stack([rng.permutation(n) for _ in range(n)]).reshape(-1)
-         for _ in range(B)]), jnp.int32)  # unsorted, unique per row
+    cols_b = jnp.asarray(
+        np.stack(
+            [
+                np.stack([rng.permutation(n) for _ in range(n)]).reshape(-1)
+                for _ in range(B)
+            ]
+        ),
+        jnp.int32,
+    )  # unsorted, unique per row
     offsets = jnp.asarray(np.arange(n + 1) * n, jnp.int32)
     vals_b = jnp.asarray(rng.standard_normal((B, n * n)))
 
-    tv, to, tc = jax.jit(jax.vmap(
-        _transpose_csr, in_axes=(0, None, 0)))(vals_b, offsets, cols_b)
+    tv, to, tc = jax.jit(jax.vmap(_transpose_csr, in_axes=(0, None, 0)))(
+        vals_b, offsets, cols_b
+    )
     for i in range(B):
         ev, eo, ec, _ = _transpose_reference(
-            np.asarray(vals_b[i]), np.asarray(offsets), np.asarray(cols_b[i]))
+            np.asarray(vals_b[i]), np.asarray(offsets), np.asarray(cols_b[i])
+        )
         np.testing.assert_array_equal(np.asarray(tv[i]), ev)
         np.testing.assert_array_equal(np.asarray(to[i]), eo)
         np.testing.assert_array_equal(np.asarray(tc[i]), ec)
@@ -196,13 +208,18 @@ def test_cusparse_transpose_batched_patterns():
             tv, _, _ = _transpose_csr(v, offsets, c)
             updated = cudss.refactorize(transposed, 2 * tv.conj())
             return original + cudss.solve(updated, bb)
+
         return jnp.sum(jnp.abs(jax.vmap(one)(vals_b, cols_b, b)) ** 2)
 
     def dense_loss(vals_b, b):
         def one(v, c, bb):
-            A = jnp.zeros((n, n), dtype=v.dtype).at[
-                jnp.repeat(jnp.arange(n), n), c].set(v)
+            A = (
+                jnp.zeros((n, n), dtype=v.dtype)
+                .at[jnp.repeat(jnp.arange(n), n), c]
+                .set(v)
+            )
             return jnp.linalg.solve(A, bb) + jnp.linalg.solve(2 * A.conj().T, bb)
+
         return jnp.sum(jnp.abs(jax.vmap(one)(vals_b, cols_b, b)) ** 2)
 
     g = jax.jit(jax.value_and_grad(loss))(vals_b, b.astype(vals_b.dtype))
@@ -232,8 +249,9 @@ def test_cusparse_transpose_complex_jvp_and_vjp():
         lambda data: _transpose_csr(data, offsets, columns)[0], values
     )
     expected = jnp.zeros_like(cotangent).at[order].set(cotangent)
-    np.testing.assert_array_equal(np.asarray(pullback(cotangent)[0]),
-                                  np.asarray(expected))
+    np.testing.assert_array_equal(
+        np.asarray(pullback(cotangent)[0]), np.asarray(expected)
+    )
 
 
 def test_cusparse_transpose_uses_explicit_typed_ffi():
@@ -254,15 +272,15 @@ def test_cusparse_transpose_uses_explicit_typed_ffi():
     assert "lexsort" not in text
 
     batch = jnp.stack((values, 2.0 * values, -values))
-    transpose_batch = jax.jit(jax.vmap(
-        _transpose_csr,
-        in_axes=(0, None, None),
-        out_axes=(0, None, None),
-    ))
+    transpose_batch = jax.jit(
+        jax.vmap(
+            _transpose_csr,
+            in_axes=(0, None, None),
+            out_axes=(0, None, None),
+        )
+    )
     batched_text = transpose_batch.lower(batch, offsets, columns).as_text()
-    assert batched_text.count(
-        "stablehlo.custom_call @spineax_csr_transpose_order"
-    ) == 1
+    assert batched_text.count("stablehlo.custom_call @spineax_csr_transpose_order") == 1
     assert "stablehlo.custom_call @spineax_csr_transpose_f64" not in batched_text
 
 
@@ -531,7 +549,9 @@ def test_custom_vjp_adjoint_reuse(monkeypatch):
     token_solve.defvjp(fwd, bwd)
 
     size_before = cudss.registry_size()
-    grad_b = jax.jit(jax.grad(lambda v, b: token_solve(v, b).sum(), argnums=1))(values, b)
+    grad_b = jax.jit(jax.grad(lambda v, b: token_solve(v, b).sum(), argnums=1))(
+        values, b
+    )
     expected = np.linalg.solve(np.asarray(A), np.ones(A.shape[0]))
     np.testing.assert_allclose(np.asarray(grad_b), expected, rtol=1e-10)
     # forward+backward share ONE factorization
@@ -576,7 +596,8 @@ def test_inertia_heterogeneous_batch_attribution():
     mask = np.triu(np.ones((n, n), dtype=bool))
     columns = jnp.asarray(np.nonzero(mask)[1].astype(np.int32))
     offsets = jnp.asarray(
-        np.concatenate([[0], np.cumsum(mask.sum(axis=1))]).astype(np.int32))
+        np.concatenate([[0], np.cumsum(mask.sum(axis=1))]).astype(np.int32)
+    )
     vals = jnp.asarray(np.stack([np.triu(A)[mask] for A in blocks]))
 
     token = cudss.analyze(vals, offsets, columns, mtype_id=1, mview_id=1)
@@ -605,7 +626,8 @@ def test_query_inertia_under_vmap():
     mask = np.triu(np.ones((n, n), dtype=bool))
     columns = jnp.asarray(np.nonzero(mask)[1].astype(np.int32))
     offsets = jnp.asarray(
-        np.concatenate([[0], np.cumsum(mask.sum(axis=1))]).astype(np.int32))
+        np.concatenate([[0], np.cumsum(mask.sum(axis=1))]).astype(np.int32)
+    )
     vals = jnp.asarray(np.stack([np.triu(A)[mask] for A in blocks]))
 
     @jax.jit
@@ -644,9 +666,9 @@ def test_query_inertia_under_nested_vmap():
     mask = np.triu(np.ones((n, n), dtype=bool))
     columns = jnp.asarray(np.nonzero(mask)[1].astype(np.int32))
     offsets = jnp.asarray(
-        np.concatenate([[0], np.cumsum(mask.sum(axis=1))]).astype(np.int32))
-    vals = jnp.asarray(
-        np.stack([np.triu(A)[mask] for A in blocks])).reshape(2, 2, -1)
+        np.concatenate([[0], np.cumsum(mask.sum(axis=1))]).astype(np.int32)
+    )
+    vals = jnp.asarray(np.stack([np.triu(A)[mask] for A in blocks])).reshape(2, 2, -1)
 
     @jax.jit
     @jax.vmap
@@ -684,8 +706,9 @@ def test_explicit_batch_door_under_vmap():
     assert X.shape == (2, 2, n)
     for i in range(2):
         for j in range(2):
-            assert _rel_err(float(scales[i, j]) * np.asarray(A),
-                            X[i, j], b[i, j]) < 1e-10
+            assert (
+                _rel_err(float(scales[i, j]) * np.asarray(A), X[i, j], b[i, j]) < 1e-10
+            )
 
 
 def test_grad_under_nested_vmap():
@@ -704,6 +727,7 @@ def test_grad_under_nested_vmap():
             t = cudss.analyze(v, offsets, columns)
             t = cudss.factorize(t, v)
             return cudss.solve(t, bb)
+
         return jnp.sum(jnp.sin(jax.vmap(jax.vmap(one))(vals, b)))
 
     iu = np.triu_indices(n)  # _sym_system stores the full upper triangle
@@ -712,12 +736,12 @@ def test_grad_under_nested_vmap():
         def one(v, bb):
             U = jnp.zeros((n, n), v.dtype).at[iu].set(v)
             return jnp.linalg.solve(U + U.T - jnp.diag(jnp.diag(U)), bb)
+
         return jnp.sum(jnp.sin(jax.vmap(jax.vmap(one))(vals, b)))
 
     g_vals, g_b = jax.grad(loss, argnums=(0, 1))(vals, b)
     g_vals_d, g_b_d = jax.grad(dense_loss, argnums=(0, 1))(vals, b)
-    np.testing.assert_allclose(np.asarray(g_vals), np.asarray(g_vals_d),
-                               atol=1e-9)
+    np.testing.assert_allclose(np.asarray(g_vals), np.asarray(g_vals_d), atol=1e-9)
     np.testing.assert_allclose(np.asarray(g_b), np.asarray(g_b_d), atol=1e-9)
 
 
@@ -739,13 +763,12 @@ def test_grad_through_checkpoint():
     loss_remat = lambda v: jnp.sum(jax.checkpoint(chain)(v) ** 2)
 
     assert np.isfinite(float(loss_remat(values)))  # forward through remat
-    g = jax.grad(loss_remat)(values)               # used to raise on FfiEffect
+    g = jax.grad(loss_remat)(values)  # used to raise on FfiEffect
     g_ref = jax.grad(loss)(values)
     np.testing.assert_allclose(np.asarray(g), np.asarray(g_ref), atol=1e-12)
     # and jitted, where partial-eval actually splits the jaxpr
     g_jit = jax.jit(jax.grad(loss_remat))(values)
-    np.testing.assert_allclose(np.asarray(g_jit), np.asarray(g_ref),
-                               atol=1e-12)
+    np.testing.assert_allclose(np.asarray(g_jit), np.asarray(g_ref), atol=1e-12)
 
 
 # error handling ===============================================================
@@ -873,10 +896,12 @@ def test_legacy_nested_vmap():
 
     x = jax.jit(jax.vmap(jax.vmap(token_solve)))(values, b)
     x_flat = jax.jit(jax.vmap(token_solve))(
-        values.reshape(4, -1), jnp.broadcast_to(b1, (4,) + b1.shape))
+        values.reshape(4, -1), jnp.broadcast_to(b1, (4,) + b1.shape)
+    )
     assert x.shape == (2, 2) + b1.shape
-    np.testing.assert_allclose(np.asarray(x).reshape(4, -1),
-                               np.asarray(x_flat), rtol=1e-5)
+    np.testing.assert_allclose(
+        np.asarray(x).reshape(4, -1), np.asarray(x_flat), rtol=1e-5
+    )
 
 
 @pytest.mark.parametrize(
@@ -909,7 +934,9 @@ def test_legacy_solver_types(mtype_id):
     assert jnp.allclose(x, true_x1, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64, jnp.complex64, jnp.complex128])
+@pytest.mark.parametrize(
+    "dtype", [jnp.float32, jnp.float64, jnp.complex64, jnp.complex128]
+)
 def test_query(dtype):
     _require_gpu()
     # port of the CuDSSSolverRE "return everything" test
@@ -926,8 +953,15 @@ def test_query(dtype):
     assert out["lu_nnz"][0] > 0
     assert out["npivots"][0] >= 0
     assert out["inertia"].shape == (2,)
-    for key in ("perm_reorder_row", "perm_reorder_col", "perm_row",
-                "perm_col", "perm_matching", "scale_row", "scale_col"):
+    for key in (
+        "perm_reorder_row",
+        "perm_reorder_col",
+        "perm_row",
+        "perm_col",
+        "perm_matching",
+        "scale_row",
+        "scale_col",
+    ):
         assert out[key].shape == (n,), key
     assert out["diag"].shape == (n,)
     assert out["diag"].dtype == dtype
@@ -978,10 +1012,8 @@ def test_grad_raw_explicit_phases():
         return jnp.sum(jnp.linalg.solve(A, b) ** 2)
 
     gv_d, gb_d = jax.grad(dense_loss, argnums=(0, 1))(values, b)
-    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d),
-                               rtol=1e-9, atol=1e-9)
-    np.testing.assert_allclose(np.asarray(gb), np.asarray(gb_d),
-                               rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d), rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gb), np.asarray(gb_d), rtol=1e-9, atol=1e-9)
 
 
 def test_grad_raw_full_view_and_batch():
@@ -1009,8 +1041,7 @@ def test_grad_raw_full_view_and_batch():
         return jnp.sum(jnp.linalg.solve(Ad, b) ** 2)
 
     gv_d = jax.grad(dense_loss)(sp.data, b)
-    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d),
-                               rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d), rtol=1e-9, atol=1e-9)
 
     # explicit batch door: per-block gradients through ONE block solve
     vals_batch = jnp.stack([sp.data, sp.data * 2.0])
@@ -1021,8 +1052,7 @@ def test_grad_raw_full_view_and_batch():
         t = cudss.factorize(t, vals)
         return jnp.sum(cudss.solve(t, bb) ** 2)
 
-    gv_b, gb_b = jax.jit(jax.grad(batch_loss, argnums=(0, 1)))(
-        vals_batch, b_batch)
+    gv_b, gb_b = jax.jit(jax.grad(batch_loss, argnums=(0, 1)))(vals_batch, b_batch)
 
     def dense_batch_loss(vals, bb):
         out = 0.0
@@ -1031,12 +1061,13 @@ def test_grad_raw_full_view_and_batch():
             out = out + jnp.sum(jnp.linalg.solve(Ad, bb[k]) ** 2)
         return out
 
-    gv_bd, gb_bd = jax.grad(dense_batch_loss, argnums=(0, 1))(
-        vals_batch, b_batch)
-    np.testing.assert_allclose(np.asarray(gv_b), np.asarray(gv_bd),
-                               rtol=1e-9, atol=1e-9)
-    np.testing.assert_allclose(np.asarray(gb_b), np.asarray(gb_bd),
-                               rtol=1e-9, atol=1e-9)
+    gv_bd, gb_bd = jax.grad(dense_batch_loss, argnums=(0, 1))(vals_batch, b_batch)
+    np.testing.assert_allclose(
+        np.asarray(gv_b), np.asarray(gv_bd), rtol=1e-9, atol=1e-9
+    )
+    np.testing.assert_allclose(
+        np.asarray(gb_b), np.asarray(gb_bd), rtol=1e-9, atol=1e-9
+    )
 
 
 def test_grad_general_mtype():
@@ -1063,10 +1094,8 @@ def test_grad_general_mtype():
         return jnp.sum(jnp.linalg.solve(Ad, b) ** 2)
 
     gv_d, gb_d = jax.grad(dense_loss, argnums=(0, 1))(vals, b)
-    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d),
-                               rtol=1e-9, atol=1e-9)
-    np.testing.assert_allclose(np.asarray(gb), np.asarray(gb_d),
-                               rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d), rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gb), np.asarray(gb_d), rtol=1e-9, atol=1e-9)
 
 
 def test_grad_general_complex_through_checkpoint():
@@ -1101,8 +1130,9 @@ def test_grad_general_complex_through_checkpoint():
     for candidate in (loss, checkpoint_loss):
         actual = jax.jit(jax.grad(candidate, argnums=(0, 1)))(vals, b)
         for result, reference in zip(actual, expected):
-            np.testing.assert_allclose(np.asarray(result), np.asarray(reference),
-                                       rtol=1e-9, atol=1e-9)
+            np.testing.assert_allclose(
+                np.asarray(result), np.asarray(reference), rtol=1e-9, atol=1e-9
+            )
 
 
 def test_grad_hermitian_complex():
@@ -1115,7 +1145,8 @@ def test_grad_hermitian_complex():
     H = H + H.conj().T + 2 * n * np.eye(n)
     mask = np.triu(np.ones((n, n), bool))
     offsets = jnp.asarray(
-        np.concatenate([[0], np.cumsum(mask.sum(1))]).astype(np.int32))
+        np.concatenate([[0], np.cumsum(mask.sum(1))]).astype(np.int32)
+    )
     columns = jnp.asarray(np.nonzero(mask)[1].astype(np.int32))
     rows = jnp.asarray(np.nonzero(mask)[0])
     vals = jnp.asarray(H[mask])
@@ -1136,10 +1167,8 @@ def test_grad_hermitian_complex():
         return jnp.sum(jnp.abs(jnp.linalg.solve(Ad, b)) ** 2)
 
     gv_d, gb_d = jax.grad(dense_loss, argnums=(0, 1))(vals, b)
-    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d),
-                               rtol=1e-9, atol=1e-9)
-    np.testing.assert_allclose(np.asarray(gb), np.asarray(gb_d),
-                               rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d), rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gb), np.asarray(gb_d), rtol=1e-9, atol=1e-9)
 
 
 def test_higher_order_derivatives():
@@ -1166,26 +1195,20 @@ def test_higher_order_derivatives():
     # forward-over-reverse (jax.hessian), wrt values and wrt b
     Hv = jax.jit(jax.hessian(loss))(values, b)
     Hv_d = jax.hessian(dense_loss)(values, b)
-    np.testing.assert_allclose(np.asarray(Hv), np.asarray(Hv_d),
-                               rtol=1e-8, atol=1e-8)
+    np.testing.assert_allclose(np.asarray(Hv), np.asarray(Hv_d), rtol=1e-8, atol=1e-8)
     Hb = jax.jit(jax.hessian(loss, argnums=1))(values, b)
     Hb_d = jax.hessian(dense_loss, argnums=1)(values, b)
-    np.testing.assert_allclose(np.asarray(Hb), np.asarray(Hb_d),
-                               rtol=1e-8, atol=1e-8)
+    np.testing.assert_allclose(np.asarray(Hb), np.asarray(Hb_d), rtol=1e-8, atol=1e-8)
 
     # reverse-over-reverse
     gg = jax.grad(lambda bb: jax.grad(loss, argnums=1)(values, bb).sum())(b)
-    gg_d = jax.grad(
-        lambda bb: jax.grad(dense_loss, argnums=1)(values, bb).sum())(b)
-    np.testing.assert_allclose(np.asarray(gg), np.asarray(gg_d),
-                               rtol=1e-9, atol=1e-9)
+    gg_d = jax.grad(lambda bb: jax.grad(dense_loss, argnums=1)(values, bb).sum())(b)
+    np.testing.assert_allclose(np.asarray(gg), np.asarray(gg_d), rtol=1e-9, atol=1e-9)
 
     # third order along a direction, values entering through factorize
     dv = jnp.asarray(np.random.default_rng(31).standard_normal(values.shape))
-    d3 = jax.grad(jax.grad(jax.grad(
-        lambda s: loss(values + s * dv, b))))(0.0)
-    d3_d = jax.grad(jax.grad(jax.grad(
-        lambda s: dense_loss(values + s * dv, b))))(0.0)
+    d3 = jax.grad(jax.grad(jax.grad(lambda s: loss(values + s * dv, b))))(0.0)
+    d3_d = jax.grad(jax.grad(jax.grad(lambda s: dense_loss(values + s * dv, b))))(0.0)
     np.testing.assert_allclose(float(d3), float(d3_d), rtol=1e-7)
 
 
@@ -1199,8 +1222,7 @@ def test_lineax_adapter():
     import jax.experimental.sparse as jsparse
 
     sp = jsparse.BCSR.fromdense(jnp.asarray(A))
-    operator = cudss.CSROperator(sp.data, sp.indptr, sp.indices,
-                                 lx.symmetric_tag)
+    operator = cudss.CSROperator(sp.data, sp.indptr, sp.indices, lx.symmetric_tag)
     assert lx.is_symmetric(operator)
     assert operator.transpose() is operator
     solver = cudss.CuDSS()
@@ -1215,7 +1237,8 @@ def test_lineax_adapter():
     eigs = np.linalg.eigvalsh(np.asarray(A))
     inr = cudss.inertia(solver.query(token))
     np.testing.assert_array_equal(
-        np.asarray(inr), [int((eigs > 0).sum()), int((eigs < 0).sum())])
+        np.asarray(inr), [int((eigs > 0).sum()), int((eigs < 0).sum())]
+    )
 
     # lineax protocol, interoperating with the explicit token as state=
     x2 = lx.linear_solve(operator, b, solver, state=token).value
@@ -1231,10 +1254,12 @@ def test_lineax_adapter():
 @pytest.mark.parametrize("reordering", ["default", "colamd"])
 def test_lineax_transformed_factor_state(mtype, reordering):
     _require_gpu()
-    A = jnp.asarray([
-        [2.0 + 1.0j, 1.0 - 0.5j],
-        [0.25 + 2.0j, 3.0 - 0.75j],
-    ])
+    A = jnp.asarray(
+        [
+            [2.0 + 1.0j, 1.0 - 0.5j],
+            [0.25 + 2.0j, 3.0 - 0.75j],
+        ]
+    )
     b = jnp.asarray([1.0 + 2.0j, -0.5 + 1.0j])
     offsets = jnp.asarray([0, 2, 4], dtype=jnp.int32)
     columns = jnp.asarray([0, 1, 0, 1], dtype=jnp.int32)
@@ -1243,11 +1268,22 @@ def test_lineax_transformed_factor_state(mtype, reordering):
     elif mtype == "hermitian":
         A = A + A.conj().T
     solver = cudss.CuDSS()
-    state = cudss.analyze(A.ravel(), offsets, columns, mtype_id=mtype,
-                          mview_id="full", reordering=reordering)
+    state = cudss.analyze(
+        A.ravel(),
+        offsets,
+        columns,
+        mtype_id=mtype,
+        mview_id="full",
+        reordering=reordering,
+    )
     state = cudss.factorize(state, state.values)
     solve = jax.jit(lambda token, rhs: solver.solve(token, rhs, ir_nsteps=2))
-    for transpose, conjugate in ((False, True), (True, False), (True, True), (False, False)):
+    for transpose, conjugate in (
+        (False, True),
+        (True, False),
+        (True, True),
+        (False, False),
+    ):
         solve(state, b).block_until_ready()
         count = cudss.registry_size()
         transformed, reference = state, A
@@ -1265,28 +1301,41 @@ def test_lineax_transformed_factor_state(mtype, reordering):
         if reordering == "default":
             assert cudss.registry_size() == count
         cudss.release(state)
-        np.testing.assert_allclose(solve(transformed, b), jnp.linalg.solve(reference, b),
-                                   rtol=1e-12, atol=1e-12)
-        np.testing.assert_allclose(solve(state, b), jnp.linalg.solve(A, b),
-                                   rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(
+            solve(transformed, b),
+            jnp.linalg.solve(reference, b),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            solve(state, b), jnp.linalg.solve(A, b), rtol=1e-12, atol=1e-12
+        )
         # Updating a transformed state leaves the old factors usable.
         for update in (solver.factorize, solver.refactorize):
             operator = cudss.CSROperator((2 * reference).ravel(), offsets, columns)
             updated = jax.jit(update)(transformed, operator)
             assert not np.array_equal(updated.id, state.id)
             assert jax.tree.structure(updated) == jax.tree.structure(transformed)
-            np.testing.assert_allclose(solve(updated, b),
-                                       jnp.linalg.solve(2 * reference, b),
-                                       rtol=1e-12, atol=1e-12)
-            np.testing.assert_allclose(solve(transformed, b),
-                                       jnp.linalg.solve(reference, b),
-                                       rtol=1e-12, atol=1e-12)
+            np.testing.assert_allclose(
+                solve(updated, b),
+                jnp.linalg.solve(2 * reference, b),
+                rtol=1e-12,
+                atol=1e-12,
+            )
+            np.testing.assert_allclose(
+                solve(transformed, b),
+                jnp.linalg.solve(reference, b),
+                rtol=1e-12,
+                atol=1e-12,
+            )
             cudss.release(updated)
         if reordering == "default" and mtype == "general":
+
             def loss(scale):
                 def step(token, value):
                     token = cudss.refactorize(token, value * reference.ravel())
                     return token, jnp.sum(jnp.abs(solve(token, b)) ** 2)
+
                 _, losses = jax.lax.scan(step, transformed, scale * jnp.arange(1, 3))
                 return losses.sum()
 
@@ -1314,15 +1363,16 @@ def test_lineax_general_operator():
 
     operator = cudss.CSROperator(sp.data, sp.indptr, sp.indices)
     assert not lx.is_symmetric(operator)
-    np.testing.assert_allclose(np.asarray(operator.transpose().as_matrix()),
-                               np.asarray(A).T, rtol=1e-15)
+    np.testing.assert_allclose(
+        np.asarray(operator.transpose().as_matrix()), np.asarray(A).T, rtol=1e-15
+    )
 
     token = solver.analyze(operator)
     assert token.mtype_id == 0
     sol = lx.linear_solve(operator, b, solver)
-    np.testing.assert_allclose(np.asarray(sol.value),
-                               np.linalg.solve(np.asarray(A), np.asarray(b)),
-                               rtol=1e-9)
+    np.testing.assert_allclose(
+        np.asarray(sol.value), np.linalg.solve(np.asarray(A), np.asarray(b)), rtol=1e-9
+    )
     cudss.release(sol.state)
 
     # Compare matrix and RHS derivatives against dense linear algebra.
@@ -1338,10 +1388,8 @@ def test_lineax_general_operator():
         return jnp.sum(jnp.linalg.solve(Ad, bb) ** 2)
 
     gv_d, gb_d = jax.grad(dense_loss, argnums=(0, 1))(sp.data, b)
-    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d),
-                               rtol=1e-9, atol=1e-9)
-    np.testing.assert_allclose(np.asarray(gb), np.asarray(gb_d),
-                               rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gv), np.asarray(gv_d), rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(gb), np.asarray(gb_d), rtol=1e-9, atol=1e-9)
 
 
 # lifetime =====================================================================
@@ -1397,15 +1445,17 @@ def test_cudss_config_knobs():
     lu = {}
     for alg in ("default", "none"):  # fill-reducing vs natural order
         t = cudss.factorize(
-            cudss.analyze(values, offsets, columns, reordering=alg), values)
+            cudss.analyze(values, offsets, columns, reordering=alg), values
+        )
         assert _rel_err(A, cudss.solve(t, b), b) < _TOL[jnp.float64]
         lu[alg] = int(np.asarray(cudss.query(t)["lu_nnz"])[0])
     assert lu["none"] >= lu["default"]
 
     # hybrid host+device factors, evicted and healed with the same config
     t = cudss.factorize(
-        cudss.analyze(values, offsets, columns, reordering="none",
-                      memory="hybrid"), values)
+        cudss.analyze(values, offsets, columns, reordering="none", memory="hybrid"),
+        values,
+    )
     for _ in range(cudss.cache_capacity()):
         cudss.analyze(values, offsets, columns).id.block_until_ready()
     assert _rel_err(A, cudss.solve(t, b), b) < _TOL[jnp.float64]
@@ -1415,18 +1465,24 @@ def test_cudss_config_knobs():
         cudss.analyze(values, offsets, columns, reordering="bogus")
     for alg in ("btf_colamd", "colamd", 1, 2):
         with pytest.raises(ValueError, match="solve_only=True.*BTF/COLAMD"):
-            jax.jit(lambda v: cudss.analyze(
-                v, offsets, columns, reordering=alg, solve_only=True))(values)
+            jax.jit(
+                lambda v: cudss.analyze(
+                    v, offsets, columns, reordering=alg, solve_only=True
+                )
+            )(values)
     with pytest.raises(Exception, match="invalid reordering_id"):
         # raw enum ints pass through; out-of-range is the C++ backstop
-        cudss.analyze(values, offsets, columns,
-                      reordering=9).id.block_until_ready()
+        cudss.analyze(values, offsets, columns, reordering=9).id.block_until_ready()
 
     values, offsets, columns, A = _general_complex_system(n=24)
     b = jnp.arange(1, 25, dtype=values.dtype)
     operator = cudss.CSROperator(values, offsets, columns)
-    for settings in ({"emulation_bits": 55}, {"downcast_factors": "diagonal"},
-                     {"downcast_factors": "block_diagonal"}, {"solve_only": True}):
+    for settings in (
+        {"emulation_bits": 55},
+        {"downcast_factors": "diagonal"},
+        {"downcast_factors": "block_diagonal"},
+        {"solve_only": True},
+    ):
         solver = cudss.CuDSS(**settings)
         token = solver.init(operator, {})
         solve = jax.jit(lambda t, rhs: solver.solve(t, rhs, ir_nsteps=3))
@@ -1439,7 +1495,9 @@ def test_cudss_config_knobs():
             with pytest.raises(ValueError, match="new analysis"):
                 solver.refactorize(token, operator)
         else:
-            updated = solver.refactorize(token, cudss.CSROperator(2 * values, offsets, columns))
+            updated = solver.refactorize(
+                token, cudss.CSROperator(2 * values, offsets, columns)
+            )
             assert _rel_err(2 * A, solve(updated, b), b) < 1e-10
             cudss.release(updated)
         cudss.release(token)
@@ -1482,15 +1540,21 @@ def test_concurrent_refactors_branch_from_one_token():
 
     _require_gpu()
     values, offsets, columns, A = _general_complex_system(n=80, seed=35)
-    b = jnp.asarray(np.random.default_rng(36).standard_normal(A.shape[0]), dtype=values.dtype)
-    token = cudss.factorize(cudss.analyze(values, offsets, columns,
-                                        mtype_id="general", mview_id="full"), values)
+    b = jnp.asarray(
+        np.random.default_rng(36).standard_normal(A.shape[0]), dtype=values.dtype
+    )
+    token = cudss.factorize(
+        cudss.analyze(values, offsets, columns, mtype_id="general", mview_id="full"),
+        values,
+    )
 
     # Compile before dispatching the same resident state from two host threads.
     warm = cudss.refactorize(token, 1.5 * values)
     warm.id.block_until_ready()
-    token = cudss.factorize(cudss.analyze(values, offsets, columns,
-                                        mtype_id="general", mview_id="full"), values)
+    token = cudss.factorize(
+        cudss.analyze(values, offsets, columns, mtype_id="general", mview_id="full"),
+        values,
+    )
 
     def branch(scale):
         result = cudss.refactorize(token, scale * values)
