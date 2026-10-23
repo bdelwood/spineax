@@ -905,10 +905,11 @@ def test_legacy_solver_types(mtype_id):
     assert jnp.allclose(x, true_x1, rtol=1e-5, atol=1e-5)
 
 
-def test_query():
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float64, jnp.complex64, jnp.complex128])
+def test_query(dtype):
     _require_gpu()
     # port of the CuDSSSolverRE "return everything" test
-    M1, b1, _, true_x1 = _legacy_base_system(jnp.float32)
+    M1, b1, _, true_x1 = _legacy_base_system(dtype)
     offsets, columns, values = _csr_of(M1)  # upper triangle, mview upper
     n = b1.shape[0]
 
@@ -925,7 +926,10 @@ def test_query():
                 "perm_col", "perm_matching", "scale_row", "scale_col"):
         assert out[key].shape == (n,), key
     assert out["diag"].shape == (n,)
-    assert out["diag"].dtype == jnp.float32
+    assert out["diag"].dtype == dtype
+    for key in ("scale_row", "scale_col"):
+        assert out[key].dtype == jnp.finfo(dtype).dtype
+        assert jnp.all(jnp.isfinite(out[key]) & (out[key] > 0))
     assert out["nd_partition_tree"].shape[0] > 0
     assert out["nsuperpanels"].shape == (1,)
     assert out["schur_shape"].shape == (2,)

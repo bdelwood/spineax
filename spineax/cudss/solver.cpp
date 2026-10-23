@@ -18,11 +18,11 @@ namespace ffi = xla::ffi;
 namespace nb = nanobind;
 
 // Helper function for data types ==============================================
-template <ffi::DataType T> cudssDataType_t get_cudss_data_type();
-template<> cudssDataType_t get_cudss_data_type<ffi::F32>() { return CUDSS_R_32F; }
-template<> cudssDataType_t get_cudss_data_type<ffi::F64>() { return CUDSS_R_64F; }
-template<> cudssDataType_t get_cudss_data_type<ffi::C64>() { return CUDSS_C_32F; }
-template<> cudssDataType_t get_cudss_data_type<ffi::C128>() { return CUDSS_C_64F; }
+template <ffi::DataType T> cudaDataType_t get_cudss_data_type();
+template<> cudaDataType_t get_cudss_data_type<ffi::F32>() { return CUDA_R_32F; }
+template<> cudaDataType_t get_cudss_data_type<ffi::F64>() { return CUDA_R_64F; }
+template<> cudaDataType_t get_cudss_data_type<ffi::C64>() { return CUDA_C_32F; }
+template<> cudaDataType_t get_cudss_data_type<ffi::C128>() { return CUDA_C_64F; }
 
 template <ffi::DataType T>
 struct get_native_data_type;
@@ -30,6 +30,10 @@ template<> struct get_native_data_type<ffi::F32> { using type = float; };
 template<> struct get_native_data_type<ffi::F64> { using type = double; };
 template<> struct get_native_data_type<ffi::C64> { using type = std::complex<float>; };
 template<> struct get_native_data_type<ffi::C128> { using type = std::complex<double>; };
+
+template <ffi::DataType T>
+constexpr ffi::DataType real_data_type =
+    (T == ffi::F64 || T == ffi::C128) ? ffi::F64 : ffi::F32;
 
 #define CUDSS_TOKEN_CHECK(call, msg) \
     do { \
@@ -78,7 +82,7 @@ struct BatchFactorEntry {
     uint32_t fp[2] = {0, 0};       // structure fingerprint from analysis
     int64_t block_n = 0, block_nnz = 0, batch = 0;  // system N = batch*block_n
     size_t elem_size = 0;
-    cudssDataType_t dtype = CUDSS_R_64F;
+    cudaDataType_t dtype = CUDA_R_64F;
     cudssMatrixType_t mtype = CUDSS_MTYPE_SYMMETRIC;
     cudssMatrixViewType_t mview = CUDSS_MVIEW_UPPER;
     int64_t device_id = 0;
@@ -355,6 +359,12 @@ static ffi::Error create_entry(
     CUDSS_TOKEN_CHECK(cudssCreate(&e->handle), "cudssCreate");
     CUDSS_TOKEN_CHECK(cudssSetStream(e->handle, stream), "cudssSetStream");
     CUDSS_TOKEN_CHECK(cudssConfigCreate(&e->config), "cudssConfigCreate");
+    // Per-block inertia requires scalar pivots; cuDSS omits 2x2 off-diagonals.
+    if ((mtype_id == 1 || mtype_id == 2) && reordering_id != 1 && reordering_id != 2) {
+        auto pivot = CUDSS_PIVOT_DIAGONAL;
+        CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_PIVOT_TYPE,
+            &pivot, sizeof(pivot)), "cudssConfigSet pivot type");
+    }
     if (reordering_id < 0 || reordering_id > CUDSS_REORDERING_ALG_NONE) {
         return ffi::Error::Internal(
             "spineax pbatch token: invalid reordering_id (cudssReorderingAlg_t: "
@@ -382,7 +392,7 @@ static ffi::Error create_entry(
         const_cast<int32_t*>(offsets_buf.typed_data()), NULL,
         const_cast<int32_t*>(columns_buf.typed_data()),
         const_cast<nat*>(csr_values_buf.typed_data()),
-        CUDSS_R_32I, CUDSS_R_32I, e->dtype,
+        CUDA_R_32I, CUDA_R_32I, e->dtype,
         e->mtype, e->mview, CUDSS_BASE_ZERO), "cudssMatrixCreateCsr");
 
     // Placeholder dense descriptors: ANALYSIS/FACTORIZATION never dereference
@@ -588,8 +598,8 @@ static ffi::Error PbatchTokenQuery(
     ffi::ResultBuffer<ffi::S32> perm_col_buf,          // [N] (reordering alg 1/2 only)
     ffi::ResultBuffer<ffi::S32> perm_matching_buf,     // [N]
     ffi::ResultBuffer<T> diag_buf,                     // [N]
-    ffi::ResultBuffer<ffi::F32> scale_row_buf,         // [N]
-    ffi::ResultBuffer<ffi::F32> scale_col_buf,         // [N]
+    ffi::ResultBuffer<real_data_type<T>> scale_row_buf, // [N]
+    ffi::ResultBuffer<real_data_type<T>> scale_col_buf, // [N]
     ffi::ResultBuffer<ffi::S32> nd_partition_tree_buf, // [kNdPartitionTreeSize]
     ffi::ResultBuffer<ffi::S32> nsuperpanels_buf,      // [1]
     ffi::ResultBuffer<ffi::S64> schur_shape_buf,       // [2]
@@ -674,8 +684,8 @@ static ffi::Error PbatchTokenQuery(
     QUERY_DEVICE_ARRAY(CUDSS_DATA_PERM_COL, perm_col_buf, N * sizeof(int32_t));
     QUERY_DEVICE_ARRAY(CUDSS_DATA_PERM_MATCHING, perm_matching_buf, N * sizeof(int32_t));
     QUERY_DEVICE_ARRAY(CUDSS_DATA_DIAG, diag_buf, N * (int64_t)e->elem_size);
-    QUERY_DEVICE_ARRAY(CUDSS_DATA_SCALE_ROW, scale_row_buf, N * sizeof(float));
-    QUERY_DEVICE_ARRAY(CUDSS_DATA_SCALE_COL, scale_col_buf, N * sizeof(float));
+    QUERY_DEVICE_ARRAY(CUDSS_DATA_SCALE_ROW, scale_row_buf, scale_row_buf->size_bytes());
+    QUERY_DEVICE_ARRAY(CUDSS_DATA_SCALE_COL, scale_col_buf, scale_col_buf->size_bytes());
     // cuDSS >= 0.8 removed CUDSS_DATA_ELIMINATION_TREE; the nested-dissection
     // partition tree is its successor and exposes the same reordering structure.
     QUERY_DEVICE_ARRAY(CUDSS_DATA_ND_PARTITION_TREE, nd_partition_tree_buf,
@@ -767,8 +777,8 @@ static ffi::Error PbatchTokenQuery(
             .Ret<ffi::Buffer<ffi::S32>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
             .Ret<ffi::Buffer<DataType>>() \
-            .Ret<ffi::Buffer<ffi::F32>>() \
-            .Ret<ffi::Buffer<ffi::F32>>() \
+            .Ret<ffi::Buffer<real_data_type<DataType>>>() \
+            .Ret<ffi::Buffer<real_data_type<DataType>>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
             .Ret<ffi::Buffer<ffi::S64>>() \

@@ -21,7 +21,7 @@ except ImportError as e:
         "token API treats a single solve as the batch_size=1 case of the "
         "block-diagonal batch construction, which lives there. Was the "
         "package built with its CUDA extension (pip install with CUDA "
-        "toolkit + cuDSS >= 0.8 available)?"
+        "toolkit + cuDSS >= 1.0 available)?"
     ) from e
 
 # registrations ================================================================
@@ -877,8 +877,8 @@ def _make_query(suffix, dtype, n, tree, cfg):
                 jax.ShapeDtypeStruct((n,), jnp.int32),        # perm_col
                 jax.ShapeDtypeStruct((n,), jnp.int32),        # perm_matching
                 jax.ShapeDtypeStruct((n,), dtype),            # diag
-                jax.ShapeDtypeStruct((n,), jnp.float32),      # scale_row
-                jax.ShapeDtypeStruct((n,), jnp.float32),      # scale_col
+                jax.ShapeDtypeStruct((n,), jnp.finfo(dtype).dtype),  # scale_row
+                jax.ShapeDtypeStruct((n,), jnp.finfo(dtype).dtype),  # scale_col
                 jax.ShapeDtypeStruct((tree,), jnp.int32),     # nd_partition_tree
                 jax.ShapeDtypeStruct((1,), jnp.int32),        # nsuperpanels
                 jax.ShapeDtypeStruct((2,), jnp.int64),        # schur_shape
@@ -928,8 +928,11 @@ def query(token: FactorToken) -> dict:
 
 
 def inertia(data: dict, batch_size: int = 1):
-    """Per-block [positive, negative] LDL^T inertia from ``query`` output. CuDSS
-    doesnt yet reliably return 0 eigenvalues as of 0.8.
+    """Per-block [positive, negative] inertia from the LDL factor diagonal.
+
+    Factorizations use scalar pivots so each sign belongs to one input block.
+    cuDSS omits the off-diagonal entries needed to count signs of 2x2 pivots.
+    Magnitudes below 1e-13 are excluded from both counts.
     """
     diag = data["diag"]
     diag_real = diag.real if jnp.iscomplexobj(diag) else diag
