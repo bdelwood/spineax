@@ -183,26 +183,32 @@ def test_cusparse_transpose_batched_patterns():
     # Make each matrix diagonally dominant despite its permuted columns.
     rows_flat = jnp.repeat(jnp.arange(n, dtype=jnp.int32), n)
     vals_b = jnp.where(cols_b == rows_flat[None, :], 3.0 * n, vals_b)
+    vals_b = vals_b + 0.1j * jnp.asarray(rng.standard_normal(vals_b.shape))
     b = jnp.asarray(rng.standard_normal((B, n)))
 
     def loss(vals_b, b):
         def one(v, c, bb):
             t = cudss.analyze(v, offsets, c, mtype_id=0, mview_id=0)
             t = cudss.factorize(t, v)
-            return cudss.solve(t, bb)
-        return jnp.sum(jax.vmap(one)(vals_b, cols_b, b) ** 2)
+            original = cudss.solve(t, bb)
+            transposed, _ = cudss.CuDSS().transpose(t, {})
+            transposed, _ = cudss.CuDSS().conj(transposed, {})
+            tv, _, _ = _transpose_csr(v, offsets, c)
+            updated = cudss.refactorize(transposed, 2 * tv.conj())
+            return original + cudss.solve(updated, bb)
+        return jnp.sum(jnp.abs(jax.vmap(one)(vals_b, cols_b, b)) ** 2)
 
     def dense_loss(vals_b, b):
         def one(v, c, bb):
-            A = jnp.zeros((n, n)).at[
+            A = jnp.zeros((n, n), dtype=v.dtype).at[
                 jnp.repeat(jnp.arange(n), n), c].set(v)
-            return jnp.linalg.solve(A, bb)
-        return jnp.sum(jax.vmap(one)(vals_b, cols_b, b) ** 2)
+            return jnp.linalg.solve(A, bb) + jnp.linalg.solve(2 * A.conj().T, bb)
+        return jnp.sum(jnp.abs(jax.vmap(one)(vals_b, cols_b, b)) ** 2)
 
-    g = jax.jit(jax.grad(loss))(vals_b, b)
-    g_ref = jax.grad(dense_loss)(vals_b, b)
-    np.testing.assert_allclose(np.asarray(g), np.asarray(g_ref),
-                               rtol=1e-9, atol=1e-9)
+    g = jax.jit(jax.value_and_grad(loss))(vals_b, b.astype(vals_b.dtype))
+    g_ref = jax.value_and_grad(dense_loss)(vals_b, b)
+    for actual, expected in zip(g, g_ref):
+        np.testing.assert_allclose(actual, expected, rtol=1e-9, atol=1e-9)
 
 
 def test_cusparse_transpose_complex_jvp_and_vjp():
@@ -1240,9 +1246,10 @@ def test_lineax_transformed_factor_state(mtype, reordering):
     state = cudss.analyze(A.ravel(), offsets, columns, mtype_id=mtype,
                           mview_id="full", reordering=reordering)
     state = cudss.factorize(state, state.values)
-    count = cudss.registry_size()
     solve = jax.jit(lambda token, rhs: solver.solve(token, rhs, ir_nsteps=2))
     for transpose, conjugate in ((False, True), (True, False), (True, True), (False, False)):
+        solve(state, b).block_until_ready()
+        count = cudss.registry_size()
         transformed, reference = state, A
         if transpose:
             transformed, _ = jax.jit(solver.transpose)(transformed, {})
@@ -1262,6 +1269,33 @@ def test_lineax_transformed_factor_state(mtype, reordering):
                                    rtol=1e-12, atol=1e-12)
         np.testing.assert_allclose(solve(state, b), jnp.linalg.solve(A, b),
                                    rtol=1e-12, atol=1e-12)
+        # Updating a transformed state leaves the old factors usable.
+        for update in (solver.factorize, solver.refactorize):
+            operator = cudss.CSROperator((2 * reference).ravel(), offsets, columns)
+            updated = jax.jit(update)(transformed, operator)
+            assert not np.array_equal(updated.id, state.id)
+            assert jax.tree.structure(updated) == jax.tree.structure(transformed)
+            np.testing.assert_allclose(solve(updated, b),
+                                       jnp.linalg.solve(2 * reference, b),
+                                       rtol=1e-12, atol=1e-12)
+            np.testing.assert_allclose(solve(transformed, b),
+                                       jnp.linalg.solve(reference, b),
+                                       rtol=1e-12, atol=1e-12)
+            cudss.release(updated)
+        if reordering == "default" and mtype == "general":
+            def loss(scale):
+                def step(token, value):
+                    token = cudss.refactorize(token, value * reference.ravel())
+                    return token, jnp.sum(jnp.abs(solve(token, b)) ** 2)
+                _, losses = jax.lax.scan(step, transformed, scale * jnp.arange(1, 3))
+                return losses.sum()
+
+            reference_norm = jnp.sum(jnp.abs(jnp.linalg.solve(reference, b)) ** 2)
+            actual = jax.jit(jax.value_and_grad(loss))(2.0)
+            expected = jax.value_and_grad(
+                lambda scale: reference_norm * jnp.sum((scale * jnp.arange(1, 3)) ** -2)
+            )(2.0)
+            np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
     cudss.release(state)
 
 

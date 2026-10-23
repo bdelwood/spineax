@@ -87,8 +87,9 @@ class FactorToken(eqx.Module):
     phase. The static fields resolve dispatch at trace time and make the
     token self-describing — a FactorToken is directly a lineax solver state.
 
-    Transpose and conjugate solves share factors. Numeric updates require
-    the original token. Released factors are rebuilt on the next solve.
+    Transpose and conjugate solves share factors. Updates use the transformed
+    CSR ordering and create independent factors. Released factors are rebuilt
+    on the next solve.
     """
 
     id: Array                                # int32[1] (+1 axis per vmap level) — traced
@@ -514,8 +515,6 @@ def _require_factorized(token, op):
 
 def _numeric(token, csr_values, refactor):
     op = "refactorize" if refactor else "factorize"
-    if token.transposed or token.conjugated:
-        raise ValueError(f"{op} requires the original, untransformed token")
     if refactor:
         _require_factorized(token, op)
     if jnp.dtype(csr_values.dtype) != token.dtype:
@@ -534,6 +533,21 @@ def _numeric(token, csr_values, refactor):
             f"spineax tokens: {op} on a batch token expects values "
             f"({B}, {token.nnz}) (leading axes flattening to {B}), "
             f"got {csr_values.shape}")
+    if token.transposed or token.conjugated:
+        offsets, columns, _ = _expand_structure(token.offsets, token.columns, B)
+        # Undo the view so the token's pattern and loop-carry metadata stay fixed.
+        if token.transposed:
+            order = _transpose_csr_order(offsets, columns)
+            csr_values = jnp.zeros_like(csr_values).reshape(-1).at[order].set(
+                csr_values.reshape(-1)).reshape(csr_values.shape)
+        if token.conjugated:
+            csr_values = jnp.conj(csr_values)
+        fresh = _make_analyze_ad(_suffix(token.dtype), _cfg_of(token))(
+            csr_values.reshape(-1), offsets, columns)
+        fresh = _make_numeric_ad(False)(fresh, csr_values.reshape(-1))
+        return dataclasses.replace(
+            token, id=jnp.broadcast_to(fresh.id, token.id.shape),
+            values=csr_values, phase="factorized")
     return _make_numeric_ad(refactor)(token, csr_values)
 
 
