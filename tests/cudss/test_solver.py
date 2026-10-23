@@ -180,9 +180,7 @@ def test_cusparse_transpose_batched_patterns():
         np.testing.assert_array_equal(np.asarray(to[i]), eo)
         np.testing.assert_array_equal(np.asarray(tc[i]), ec)
 
-    # ...and through reverse mode of a vmapped GENERAL solve (the path that
-    # builds A^T per backward execution). Make the diagonal dominant: it
-    # sits wherever a row's (permuted) column index equals the row.
+    # Make each matrix diagonally dominant despite its permuted columns.
     rows_flat = jnp.repeat(jnp.arange(n, dtype=jnp.int32), n)
     vals_b = jnp.where(cols_b == rows_flat[None, :], 3.0 * n, vals_b)
     b = jnp.asarray(rng.standard_normal((B, n)))
@@ -1036,8 +1034,7 @@ def test_grad_raw_full_view_and_batch():
 
 
 def test_grad_general_mtype():
-    """Reverse mode through a GENERAL (mtype 0) solve: cuDSS has no
-    transpose solve, so the backward pass factorizes A^T on the fly."""
+    """A general solve differentiates like dense linear algebra."""
     _require_gpu()
     n = 12
     rng = np.random.default_rng(26)
@@ -1224,9 +1221,9 @@ def test_lineax_adapter():
     assert cudss.release(sol.state) is True
 
 
-def test_lineax_conjugates_complex_factor_state():
-    import lineax as lx
-
+@pytest.mark.parametrize("mtype", ["general", "symmetric", "hermitian"])
+@pytest.mark.parametrize("reordering", ["default", "colamd"])
+def test_lineax_transformed_factor_state(mtype, reordering):
     _require_gpu()
     A = jnp.asarray([
         [2.0 + 1.0j, 1.0 - 0.5j],
@@ -1235,27 +1232,41 @@ def test_lineax_conjugates_complex_factor_state():
     b = jnp.asarray([1.0 + 2.0j, -0.5 + 1.0j])
     offsets = jnp.asarray([0, 2, 4], dtype=jnp.int32)
     columns = jnp.asarray([0, 1, 0, 1], dtype=jnp.int32)
-    operator = cudss.CSROperator(A.reshape(-1), offsets, columns)
+    if mtype == "symmetric":
+        A = A + A.T
+    elif mtype == "hermitian":
+        A = A + A.conj().T
     solver = cudss.CuDSS()
-
-    state = solver.init(operator, {})
-    conjugated, _ = jax.jit(solver.conj)(state, {})
-    expected = solver.init(lx.conj(operator), {})
-
-    actual_x = solver.solve(conjugated, b)
-    expected_x = solver.solve(expected, b)
-    np.testing.assert_allclose(np.asarray(actual_x), np.asarray(expected_x),
-                               rtol=1e-12, atol=1e-12)
-    assert _rel_err(np.conj(np.asarray(A)), actual_x, b) < 1e-12
-    assert cudss.release(state) is True
-    assert cudss.release(conjugated) is True
-    assert cudss.release(expected) is True
+    state = cudss.analyze(A.ravel(), offsets, columns, mtype_id=mtype,
+                          mview_id="full", reordering=reordering)
+    state = cudss.factorize(state, state.values)
+    count = cudss.registry_size()
+    solve = jax.jit(lambda token, rhs: solver.solve(token, rhs, ir_nsteps=2))
+    for transpose, conjugate in ((False, True), (True, False), (True, True), (False, False)):
+        transformed, reference = state, A
+        if transpose:
+            transformed, _ = jax.jit(solver.transpose)(transformed, {})
+            reference = reference.T
+        if conjugate:
+            transformed, _ = jax.jit(solver.conj)(transformed, {})
+            reference = reference.conj()
+        np.testing.assert_array_equal(transformed.id, state.id)
+        for rhs in (b, jnp.stack([b, 2 * b])):
+            actual = solve(transformed, rhs)
+            expected = jnp.linalg.solve(reference, rhs.T).T
+            np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+        if reordering == "default":
+            assert cudss.registry_size() == count
+        cudss.release(state)
+        np.testing.assert_allclose(solve(transformed, b), jnp.linalg.solve(reference, b),
+                                   rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(solve(state, b), jnp.linalg.solve(A, b),
+                                   rtol=1e-12, atol=1e-12)
+    cudss.release(state)
 
 
 def test_lineax_general_operator():
-    """Untagged CSROperator = general (mtype 0): transpose is a real CSR
-    transpose, and gradients through lx.linear_solve pay for one transposed
-    factorization in the backward pass (no cuDSS transpose solve)."""
+    """General operators and their derivatives agree with dense solves."""
     import lineax as lx
     import jax.experimental.sparse as jsparse
 
@@ -1280,8 +1291,7 @@ def test_lineax_general_operator():
                                rtol=1e-9)
     cudss.release(sol.state)
 
-    # gradient through lx.linear_solve (exercises solver.transpose -> A^T
-    # factorization) vs dense reference
+    # Compare matrix and RHS derivatives against dense linear algebra.
     def loss(vals, bb):
         op = cudss.CSROperator(vals, sp.indptr, sp.indices)
         return jnp.sum(lx.linear_solve(op, bb, solver).value ** 2)
@@ -1400,14 +1410,16 @@ def test_concurrent_refactors_branch_from_one_token():
     from concurrent.futures import ThreadPoolExecutor
 
     _require_gpu()
-    values, offsets, columns, A = _sym_system(n=80, seed=35)
-    b = jnp.asarray(np.random.default_rng(36).standard_normal(A.shape[0]))
-    token = cudss.factorize(cudss.analyze(values, offsets, columns), values)
+    values, offsets, columns, A = _general_complex_system(n=80, seed=35)
+    b = jnp.asarray(np.random.default_rng(36).standard_normal(A.shape[0]), dtype=values.dtype)
+    token = cudss.factorize(cudss.analyze(values, offsets, columns,
+                                        mtype_id="general", mview_id="full"), values)
 
     # Compile before dispatching the same resident state from two host threads.
     warm = cudss.refactorize(token, 1.5 * values)
     warm.id.block_until_ready()
-    token = cudss.factorize(cudss.analyze(values, offsets, columns), values)
+    token = cudss.factorize(cudss.analyze(values, offsets, columns,
+                                        mtype_id="general", mview_id="full"), values)
 
     def branch(scale):
         result = cudss.refactorize(token, scale * values)
@@ -1420,3 +1432,17 @@ def test_concurrent_refactors_branch_from_one_token():
     for scale, result in zip((2.0, 3.0), branches):
         assert _rel_err(scale * A, cudss.solve(result, b), b) < _TOL[jnp.float64]
     assert _rel_err(A, cudss.solve(token, b), b) < _TOL[jnp.float64]
+
+    solver = cudss.CuDSS()
+    transposed, _ = solver.transpose(token, {})
+    conjugated, _ = solver.conj(token, {})
+    adjoint, _ = solver.conj(transposed, {})
+    states = (token, transposed, conjugated, adjoint)
+    matrices = (A, A.T, A.conj(), A.conj().T)
+    solve = jax.jit(lambda t: solver.solve(t, b, ir_nsteps=1))
+    for state in states:
+        solve(state).block_until_ready()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda t: solve(t).block_until_ready(), states * 4))
+    for matrix, result in zip(matrices * 4, results):
+        assert _rel_err(matrix, result, b) < 1e-12

@@ -517,7 +517,8 @@ static ffi::Error PbatchTokenSolve(
     const int64_t mtype_id,
     const int64_t mview_id,
     const int64_t reordering_id,
-    const int64_t memory_id
+    const int64_t memory_id,
+    const int64_t solve_mode
 ) {
     PhaseLease lease;
     if (auto err = token_begin_phase<T>(stream, token_in, device_id, &lease);
@@ -556,6 +557,11 @@ static ffi::Error PbatchTokenSolve(
             " is not a multiple of batch*n = " + std::to_string(N));
     }
     int64_t nrhs = b_values_buf.element_count() / N;
+
+    // Set every solve under the entry lock; transformed tokens share factors.
+    auto mode = static_cast<cudssSolveMode_t>(solve_mode);
+    CUDSS_TOKEN_CHECK(cudssConfigSet(e->config, CUDSS_CONFIG_SOLVE_MODE,
+        &mode, sizeof(mode)), "cudssConfigSet solve mode");
 
     cudssMatrix_t bmat = nullptr, xmat = nullptr;
     CUDSS_TOKEN_CHECK(cudssMatrixCreateDn(&bmat, N, nrhs, N,
@@ -758,7 +764,8 @@ static ffi::Error PbatchTokenQuery(
             .Attr<int64_t>("mtype_id") \
             .Attr<int64_t>("mview_id") \
             .Attr<int64_t>("reordering_id") \
-            .Attr<int64_t>("memory_id")); \
+            .Attr<int64_t>("memory_id") \
+            .Attr<int64_t>("solve_mode")); \
     \
     XLA_FFI_DEFINE_HANDLER(kPbatchTokenQuery##TypeName, PbatchTokenQuery<DataType>, \
         ffi::Ffi::Bind() \

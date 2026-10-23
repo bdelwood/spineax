@@ -86,6 +86,9 @@ class FactorToken(eqx.Module):
     always reads live buffers; ``values`` is the values of the last numeric
     phase. The static fields resolve dispatch at trace time and make the
     token self-describing — a FactorToken is directly a lineax solver state.
+
+    Transpose and conjugate solves share factors. Numeric updates require
+    the original token. Released factors are rebuilt on the next solve.
     """
 
     id: Array                                # int32[1] (+1 axis per vmap level) — traced
@@ -103,6 +106,8 @@ class FactorToken(eqx.Module):
     device_id: int = eqx.field(static=True)
     reordering_id: int = eqx.field(static=True)  # cudssReorderingAlg_t 0-5
     memory_id: int = eqx.field(static=True)      # 0 device, 1 hybrid host+device
+    transposed: bool = eqx.field(static=True, default=False)
+    conjugated: bool = eqx.field(static=True, default=False)
 
 
 def _structure_fingerprint(offsets_bd, columns_bd):
@@ -304,12 +309,12 @@ def _ffi_numeric(token_id, offsets_bd, columns_bd, fingerprint, values, *, op,
 
 
 def _ffi_solve(token_id, offsets_bd, columns_bd, fingerprint, values, b, *,
-               cfg):
+               cfg, mode):
     (x,) = _ffi_call4(
         f"spineax_token_solve_{_suffix(b.dtype)}",
         (jax.ShapeDtypeStruct(b.shape, b.dtype),),
         token_id, offsets_bd, columns_bd, fingerprint, values, b,
-        **dict(zip(_CFG_KEYS, cfg)))
+        solve_mode=mode, **dict(zip(_CFG_KEYS, cfg)))
     return x
 
 
@@ -372,7 +377,7 @@ def _make_numeric(suffix, refactor, cfg):
 
 
 @lru_cache(maxsize=None)
-def _make_solve(suffix, cfg):
+def _make_solve(suffix, cfg, mode):
     del suffix
 
     @jax.custom_batching.custom_vmap
@@ -381,7 +386,7 @@ def _make_solve(suffix, cfg):
         # multi-RHS SOLVE (nrhs is derived from element counts).
         offs_bd, cols_bd, fp = _expand_structure(offsets, columns, 1)
         return _ffi_solve(token_id, offs_bd, cols_bd, fp, values, b_values,
-                          cfg=cfg)
+                          cfg=cfg, mode=mode)
 
     @solve_id.def_vmap
     def _(axis_size, in_batched, token_id, offsets, columns, values, b_values):
@@ -509,6 +514,8 @@ def _require_factorized(token, op):
 
 def _numeric(token, csr_values, refactor):
     op = "refactorize" if refactor else "factorize"
+    if token.transposed or token.conjugated:
+        raise ValueError(f"{op} requires the original, untransformed token")
     if refactor:
         _require_factorized(token, op)
     if jnp.dtype(csr_values.dtype) != token.dtype:
@@ -603,25 +610,28 @@ def solve(token: FactorToken, b, ir_nsteps=None):
     def solve_fn(_mv, rhs):
         return _refined_solve(tok_ng, rhs, nsteps)
 
-    if token.mtype_id in (1, 3):  # A^T = A (incl. complex symmetric): same factors
-        return jax.lax.custom_linear_solve(mv, b, solve_fn, solve_fn,
-                                           symmetric=True)
-    if token.mtype_id in (2, 4):  # hermitian: A^T = conj(A), same factors
-
-        def t_solve(_mv, rhs):
-            return jnp.conj(_refined_solve(tok_ng, jnp.conj(rhs), nsteps))
-
-        return jax.lax.custom_linear_solve(mv, b, solve_fn, t_solve)
-
-    def t_solve(_mv, rhs):  # general: cuDSS has no transpose solve
-        return _transpose_solve_general(tok_ng, rhs, nsteps)
+    def t_solve(_mv, rhs):
+        transposed = dataclasses.replace(tok_ng, transposed=not tok_ng.transposed)
+        return _refined_solve(transposed, rhs, nsteps)
 
     return jax.lax.custom_linear_solve(mv, b, solve_fn, t_solve)
 
 
 def _solve_impl(token, b):
+    transpose = token.transposed
+    conjugate = token.conjugated
+    if token.mtype_id in (1, 3):
+        transpose = False
+    elif token.mtype_id in (2, 4):
+        # Hermitian transpose equals elementwise conjugation.
+        conjugate ^= transpose
+        transpose = False
+    mode = (2 if conjugate else 1) if transpose else 0
+    conjugate_rhs = conjugate and not transpose
+    if conjugate_rhs:
+        b = jnp.conj(b)
     B = _batch_of(token)
-    fn = _make_solve(_suffix(token.dtype), _cfg_of(token))
+    fn = _make_solve(_suffix(token.dtype), _cfg_of(token), mode)
     if B > 1 or token.id.ndim >= 2:
         # batch entry used eagerly: solve the ONE expanded block-diagonal
         # system single-style, through the same custom_vmap wrapper so any
@@ -631,8 +641,10 @@ def _solve_impl(token, b):
         tid = token.id.reshape(-1)[:1]
         bf = b.reshape(b.shape[:-2] + (-1,))
         out = fn(tid, offs_bd, cols_bd, token.values.reshape(-1), bf)
-        return out.reshape(b.shape)
-    return fn(token.id, token.offsets, token.columns, token.values, b)
+        out = out.reshape(b.shape)
+    else:
+        out = fn(token.id, token.offsets, token.columns, token.values, b)
+    return jnp.conj(out) if conjugate_rhs else out
 
 
 def _refined_solve(token, b, nsteps):
@@ -650,6 +662,8 @@ def _refined_solve(token, b, nsteps):
     callables sit inside custom_linear_solve and are only ever re-traced
     and re-applied by its IFT rules, never differentiated through.
     """
+    if token.transposed and token.mtype_id == 0 and token.reordering_id in (1, 2):
+        return _transpose_solve_general(token, b, nsteps)
     x = _solve_impl(token, b)
     refine = lambda _, x: x + _solve_impl(token, b - _matvec(token, x))
     if isinstance(nsteps, jax.Array):
@@ -684,6 +698,10 @@ def _matvec(token, x):
     offs_bd, cols_bd, _ = _expand_structure(token.offsets, token.columns, B)
     rows_bd = _pattern_rows(offs_bd, B * token.nnz)
     vals = token.values.reshape(-1)
+    if token.conjugated:
+        vals = jnp.conj(vals)
+    if token.transposed:
+        rows_bd, cols_bd = cols_bd, rows_bd
     xf = x.reshape(x.shape[:-2] + (-1,)) if B > 1 else x
     y = jnp.zeros_like(xf).at[..., rows_bd].add(
         vals * _gather_last(xf, cols_bd))
@@ -817,25 +835,17 @@ def _transpose_csr_jvp(primals, tangents):
 
 
 def _transpose_solve_general(token, rhs, nsteps):
-    """``A^-T rhs`` for a general (mtype 0) token.
-
-    cuDSS cannot solve against the transpose of existing factors
-    (CUDSS_CONFIG_SOLVE_MODE is "not supported right now" as of 0.8), so
-    reverse mode through a general solve transposes the CSR system on device
-    and runs a fresh analyze+factorize+solve. That is a full factorization
-    AND a new LRU registry entry per backward execution.
-    """
+    """Explicit transpose for BTF/COLAMD, which exclude native transpose solves."""
     B = _batch_of(token)
     offs_bd, cols_bd, _ = _expand_structure(token.offsets, token.columns, B)
     t_vals, t_offs, t_cols = _transpose_csr(token.values.reshape(-1),
                                             offs_bd, cols_bd)
-    # TODO: remove the explicit transpose and second factorization when cuDSS
-    # implements nonzero CUDSS_CONFIG_SOLVE_MODE values.
     t_token = analyze(t_vals, t_offs, t_cols,
                       mtype_id=0, mview_id=0, device_id=token.device_id,
                       reordering=token.reordering_id,
                       memory=token.memory_id)
     t_token = factorize(t_token, t_token.values)
+    t_token = dataclasses.replace(t_token, conjugated=token.conjugated)
     rf = rhs.reshape(rhs.shape[:-2] + (-1,)) if B > 1 else rhs
     return _refined_solve(t_token, rf, nsteps).reshape(rhs.shape)
 
@@ -910,6 +920,7 @@ def _make_query(suffix, dtype, n, tree, cfg):
 
 
 def query(token: FactorToken) -> dict:
+    """Read factor diagnostics; transformed tokens share the original factors."""
     _require_factorized(token, "query")
     B = _batch_of(token)
     tree = int(_ps.nd_partition_tree_size())
@@ -1078,10 +1089,8 @@ class CuDSS(lx.AbstractLinearSolver):
         symmetric                          ->  mtype 1 (LDL^T)
         untagged                           ->  mtype 0 (general LU)
 
-    General operators are fully supported, gradients included — with the
-    documented cost that anything needing ``A^T`` (lineax's backward pass,
-    ``solver.transpose``) must factorize the transpose from scratch, since
-    cuDSS has no transpose solve (design doc section 8).
+    Transpose and conjugate solves share the original factors. BTF/COLAMD
+    reorderings require a separate transpose factorization.
 
     lineax's phase boundary is operator-dependent vs vector-dependent work
     (``lx.Cholesky.init`` runs ``cho_factor``; ``compute`` runs
@@ -1156,27 +1165,12 @@ class CuDSS(lx.AbstractLinearSolver):
     def transpose(self, state, options):
         if state.mtype_id in (1, 3):
             return state, options  # A^T = A: same factorization
-        # general: cuDSS has no transpose solve, so lineax's backward pass
-        # pays for a fresh factorization of A^T (one analyze+factorize+
-        # registry entry), mirroring the raw autodiff path
-        t_vals, t_offs, t_cols = _transpose_csr(state.values, state.offsets,
-                                                state.columns)
-        t_token = analyze(t_vals, t_offs, t_cols,
-                          mtype_id=0, mview_id=0, device_id=state.device_id,
-                          reordering=state.reordering_id,
-                          memory=state.memory_id)
-        return factorize(t_token, t_token.values), options
+        return dataclasses.replace(state, transposed=not state.transposed), options
 
     def conj(self, state, options):
         if not jnp.issubdtype(state.dtype, jnp.complexfloating):
             return state, options
-        values = jnp.conj(state.values)
-        token = analyze(values, state.offsets, state.columns,
-                        mtype_id=state.mtype_id, mview_id=state.mview_id,
-                        device_id=state.device_id,
-                        reordering=state.reordering_id,
-                        memory=state.memory_id)
-        return factorize(token, values), options
+        return dataclasses.replace(state, conjugated=not state.conjugated), options
 
     def assume_full_rank(self):
         return True
